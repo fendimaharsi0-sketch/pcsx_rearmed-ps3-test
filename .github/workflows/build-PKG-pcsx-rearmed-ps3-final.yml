@@ -1,0 +1,207 @@
+# FINAL — pcsx_rearmed PS3 SELF, interpreter-only.
+# Dibersihkan dari semua eksperimen JIT (2026-10-07):
+# - Hapus ps3mapi executable memory (tidak perlu tanpa JIT)
+# - Hapus patch Lightning TOC/descriptor (_callr, _calli)
+# - Hapus LIGHTREC_CODE_INV, heartbeat log, hw_read diagnostik
+# - Hapus -D__powerpc__, -D__PSL1GHT__, unbuffered ps3jit.log
+# Alasan: diagnostic membuktikan mekanisme JIT->C Lightning PPC64 rusak
+# fundamental (3484 block dieksekusi, 0x hw_read terpanggil). Perbaikan butuh
+# tulis ulang backend — di luar scope. Interpreter stabil dan jalan.
+#
+# Pola: tiap SELF = RetroArch frontend + 1 core, static link (Plan A CE).
+# - DYNAREC=0: lightrec tidak di-compile sama sekali (binary kecil, nol risiko)
+# - drc default "disabled": redundan (tidak ada dynarec), tapi harmless
+# - Port dir RETROARCH: sharing config/aset/save dengan CE
+# - Return-to-menu patch: quit -> reboot SELF -> menu (ala CE)
+
+name: Build pcsx_rearmed PS3 SELF (interpreter final)
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_ref:
+        description: 'pcsx_rearmed ref (branch/tag/commit)'
+        default: 'master'
+        required: false
+      frontend_ref:
+        description: 'RetroArch ref to link against'
+        default: 'master'
+        required: false
+      port_dir:
+        description: 'Nama folder game PS3 yg di-share dengan CE (port dir)'
+        default: 'RETROARCH'
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    container:
+      image: reallibretroretroarch/libretro-build-psl1ght:latest
+      options: --user root
+
+    steps:
+      - name: Toolchain environment
+        run: |
+          set -eu
+          : "${PS3DEV:=/usr/local/ps3dev}"
+          : "${PSL1GHT:=$PS3DEV}"
+          {
+            echo "PS3DEV=$PS3DEV"
+            echo "PSL1GHT=$PSL1GHT"
+            echo "PATH=$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin:$PATH"
+          } >> "$GITHUB_ENV"
+          ls "$PS3DEV/ppu/bin" 2>/dev/null | grep -E '^ppu-.*gcc$' | head -3 || echo 'ppu gcc NOT FOUND'
+
+      - name: Clone sources
+        run: |
+          set -eu
+          command -v git >/dev/null || { apt-get update -qq && apt-get install -y -qq git; }
+          clone_ref() {
+            local url="$1" dir="$2" ref="$3"
+            rm -rf "$dir"
+            git init -q "$dir"
+            ( cd "$dir" && git remote add origin "$url" \
+              && git fetch -q --depth 1 origin "$ref" \
+              && git checkout -q FETCH_HEAD )
+            echo "$dir: $(cd "$dir" && git rev-parse --short HEAD)"
+          }
+          clone_ref https://github.com/libretro/pcsx_rearmed.git core "${{ inputs.core_ref }}"
+          clone_ref https://github.com/libretro/RetroArch.git frontend "${{ inputs.frontend_ref }}"
+
+      - name: Patch core (drc default off)
+        # Pastikan interpreter default walau suatu saat DYNAREC berubah.
+        run: |
+          set -eu
+          python3 - <<'EOF'
+          p = 'core/frontend/libretro_core_options.h'
+          s = open(p, encoding='utf-8').read()
+          i = s.find('"pcsx_rearmed_drc",')
+          assert i != -1, 'drc key not found'
+          seg = s[i:i+1500]
+          old = '         { NULL, NULL },\n      },\n      "enabled",'
+          assert seg.count(old) == 1, 'drc anchor=%d' % seg.count(old)
+          seg = seg.replace(old, '         { NULL, NULL },\n      },\n      "disabled",')
+          s = s[:i] + seg + s[i+1500:]
+          open(p, 'w', encoding='utf-8').write(s)
+          print('drc default -> disabled OK')
+          EOF
+
+      - name: Align port dir with CE
+        run: |
+          set -eu
+          PORT_DIR="${{ inputs.port_dir }}"
+          f=frontend/frontend/drivers/platform_ps3.c
+          grep -q '#define EMULATOR_CONTENT_DIR "SSNE10001"' "$f"
+          sed -i "s/#define EMULATOR_CONTENT_DIR \"SSNE10001\"/#define EMULATOR_CONTENT_DIR \"$PORT_DIR\"/" "$f"
+          grep -n '#define EMULATOR_CONTENT_DIR' "$f"
+
+      - name: Apply CE return-to-menu patch
+        run: |
+          set -eu
+          python3 - <<'EOF'
+          p = 'frontend/retroarch.c'
+          s = open(p, encoding='utf-8').read()
+          anchor = "      case CMD_EVENT_UNLOAD_CORE:\n         {\n"
+          assert s.count(anchor) == 1, 'anchor=%d' % s.count(anchor)
+          patch = ("      case CMD_EVENT_UNLOAD_CORE:\n"
+                   "         {\n"
+                   "            command_event(CMD_EVENT_RESTART_RETROARCH, NULL);\n"
+                   "            break;\n")
+          open(p, 'w', encoding='utf-8').write(s.replace(anchor, patch))
+          print('return-to-menu patch OK')
+          EOF
+
+      - name: Build core (static lib, interpreter only)
+        run: |
+          set -eu
+          cd core
+          make -f Makefile.libretro platform=psl1ght DYNAREC=0 -j"$(nproc)" V=1
+          ls -la pcsx_rearmed_libretro_psl1ght.a
+
+      - name: Link frontend + core, make SELF
+        run: |
+          set -eu
+          cp core/pcsx_rearmed_libretro_psl1ght.a frontend/libretro_psl1ght.a
+          cd frontend
+          make -f Makefile.psl1ght -j"$(nproc)" V=1
+          ls -la retroarch_psl1ght.self
+
+      # Aset TIDAK dibundle — pakai punya CE (temuan Fendi 2026-10-07).
+      # Core SELF jalan di ekosistem CE, baca config + aset dari sana.
+
+      - name: Package artifact
+        run: |
+          set -eu
+          SELF_NAME='pcsx_rearmed_libretro_ps3.SELF'
+          PORT_DIR="${{ inputs.port_dir }}"
+          cp frontend/retroarch_psl1ght.self "dist/$SELF_NAME"
+          {
+            echo "core:     libretro/pcsx_rearmed @ $(cd core && git rev-parse --short HEAD)"
+            echo "frontend: libretro/RetroArch @ $(cd frontend && git rev-parse --short HEAD)"
+            echo "built:    $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "dynarec:  DISABLED (interpreter only, DYNAREC=0)"
+            echo ""
+            echo "INSTALL (manual FTP):"
+            echo "  1. $SELF_NAME -> /dev_hdd0/game/$PORT_DIR/USRDIR/cores/ (FTP)"
+            echo "  2. BIOS: scph5500/5501/5502.bin -> .../USRDIR/system/"
+            echo "  3. Launch dari menu CE."
+            echo ""
+            echo "ATAU pakai PKG update (lihat artifact pcsx_rearmed_ps3_update.pkg):"
+            echo "  Install via XMB -> Package Manager. Otomatis taruh SELF di cores/."
+          } > dist/BUILD_INFO.txt
+          find dist -type f | sort
+
+      - name: Build PKG update (for CE)
+        # PKG "update" dengan TITLE_ID=RETROARCH: pas di-install, isinya
+        # merge ke /dev_hdd0/game/RETROARCH/ yang udah ada (CE).
+        # Cuma bawa SELF di USRDIR/cores/ — aset pakai punya CE.
+        run: |
+          set -eu
+          PORT_DIR="${{ inputs.port_dir }}"
+          SELF_NAME='pcsx_rearmed_libretro_ps3.SELF'
+          PKGDIR="pkg_update"
+          rm -rf "$PKGDIR"
+          mkdir -p "$PKGDIR/USRDIR/cores"
+          cp "dist/$SELF_NAME" "$PKGDIR/USRDIR/cores/"
+          # PARAM.SFO minimal (TITLE_ID harus sama dengan CE)
+          python3 - <<'EOF'
+          import struct
+          # Minimal PARAM.SFO for TITLE_ID=RETROARCH
+          # Format: header + index table + key table + data table
+          title_id = b'RETROARCH\x00'
+          # Keys: TITLE_ID, plus minimal required
+          keys = [b'TITLE_ID\x00']
+          # Build SFO
+          # Header: magic(4), version(4), key_table_start(4), data_table_start(4), entries(4)
+          # Entry: key_offset(2), data_fmt(2), data_len(4), data_max_len(4), data_offset(4)
+          key_table = b''.join(keys)
+          # Pad key table to 4-byte align
+          while len(key_table) % 4: key_table += b'\x00'
+          data = title_id
+          # Data table start = header(20) + entries(1*16) + key_table
+          key_table_start = 20 + 16
+          data_table_start = key_table_start + len(key_table)
+          header = struct.pack('<4sIIII', b'\x00PSF', 0x101, key_table_start, data_table_start, 1)
+          # Entry for TITLE_ID: key_offset=0, fmt=0x0404 (utf8), len=10, max=10, data_offset=0
+          entry = struct.pack('<HHIII', 0, 0x0404, len(title_id), len(title_id), 0)
+          sfo = header + entry + key_table + data
+          open('pkg_update/PARAM.SFO', 'wb').write(sfo)
+          print('PARAM.SFO written, TITLE_ID=RETROARCH')
+          EOF
+          ls -R "$PKGDIR"
+          # Build PKG (coba make_package_npdrm, fallback ke pesan error jelas)
+          if command -v make_package_npdrm >/dev/null 2>&1; then
+            make_package_npdrm "$PKGDIR" "dist/pcsx_rearmed_ce_update.pkg"
+            ls -lh "dist/pcsx_rearmed_ce_update.pkg"
+          else
+            echo "WARNING: make_package_npdrm tidak ditemukan di container."
+            echo "Struktur PKG ada di $PKGDIR/ — build manual pakai tool PS3."
+            # Tetap lanjut, artifact dist/ sudah ada SELF-nya
+          fi
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: pcsx_rearmed_libretro_ps3
+          path: dist/
