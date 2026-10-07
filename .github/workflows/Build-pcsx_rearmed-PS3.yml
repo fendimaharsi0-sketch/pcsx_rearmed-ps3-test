@@ -288,10 +288,12 @@ jobs:
           assert s.count(old_call) == 1, 'callr anchor count=%d' % s.count(old_call)
           new_call = ("       )\n"
                       "{\n"
-                      "#  if defined(__PSL1GHT__) || defined(__PS3__)\n"
-                      "    /* PS3: function descriptor = [addr, toc] (16 bytes).\n"
+                      "#  if defined(__PSL1GHT__) || defined(__PS3__) || defined(__powerpc64__)\n"
+                      "    /* PS3/PPC64: function descriptor = [addr, toc] (16 bytes).\n"
                       "     * NOT 24 bytes like AIX. Load TOC from [r0+8] -> r2,\n"
-                      "     * addr from [r0] -> r0. Port of irixxxx/picodrive#82. */\n"
+                      "     * addr from [r0] -> r0. Port of irixxxx/picodrive#82.\n"
+                      "     * __powerpc64__ = compiler-defined, robust kalau\n"
+                      "     * __PSL1GHT__ tidak propagate ke Lightning. */\n"
                       "    stxi(sizeof(void*) * 5, _SP_REGNO, _R2_REGNO);\n"
                       "    if (r0 == _R0_REGNO) {\n"
                       "        movr(_R11_REGNO, _R0_REGNO);\n"
@@ -316,7 +318,7 @@ jobs:
                          "\n"
                          "/* assume fixed address or reachable address */")
           assert s.count(old_restore) == 1, 'restore anchor count=%d' % s.count(old_restore)
-          new_restore = ("#  if defined(__PSL1GHT__) || defined(__PS3__) || _CALL_AIXDESC\n"
+          new_restore = ("#  if defined(__PSL1GHT__) || defined(__PS3__) || defined(__powerpc64__) || _CALL_AIXDESC\n"
                          "    ldxi(_R2_REGNO, _SP_REGNO, sizeof(void*) * 5);\n"
                          "#  endif\n"
                          "}\n"
