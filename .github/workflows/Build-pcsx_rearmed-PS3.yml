@@ -108,14 +108,23 @@ jobs:
         # BREAKTHROUGH (2026-10-07, Fendi): malloc di PS3 TIDAK executable ->
         # lightrec hang saat eksekusi kode JIT. Solusi: alokasi executable
         # memory via ps3mapi (Cobra/Mamba CFW, syscall 8).
-        # Ref: https://github.com/OsirizX/ps3mapi-lib
-        # Ref: https://github.com/irixxxx/picodrive/pull/82 (PicoDrive PS3 dynarec)
+        # Ref API client: https://github.com/OsirizX/ps3mapi-lib (master SAJA —
+        #   diverifikasi 2026-10-07: tidak ada branch page_free; TIDAK ada
+        #   ps3mapi_process_page_free di lib ini — jangan pernah panggil)
+        # Ref payload (Cobra side): https://github.com/osirizx/mamba
+        #   stage2/ps3mapi_core.c :: ps3mapi_process_page_allocate
+        #   (TheRouletteBoi, Mamba/Cobra 8.2+; opcode 0x0033; output = SATU u64
+        #   alamat via copy_to_user, bukan 2-slot table; page_size diteruskan
+        #   ke page_allocate() LV2 apa adanya; pid salah -> return ESRCH)
+        # CATATAN: irixxxx/picodrive#82 = fix TOC/OPD emitter PPC (bukan ps3mapi).
         # -D__PSL1GHT__ ditambahkan ke block psl1ght sebagai guard.
-        # Fallback: kalau ps3mapi gagal (bukan CFW Cobra), pakai malloc biasa
-        # + log warning (JIT akan hang, pakai interpreter).
+        # Fallback: kalau ps3mapi gagal, return -ENOMEM (TIDAK PERNAH malloc —
+        # Fendi: malloc pasti hang); libretro.c probe paksa interpreter.
         run: |
           set -eu
-          git clone --depth 1 --branch page_free \
+          # NOTE: repo ps3mapi-lib cuma punya branch master (tidak ada page_free,
+          # diverifikasi 2026-10-07 via GitHub branches API).
+          git clone --depth 1 \
             https://github.com/OsirizX/ps3mapi-lib.git ps3mapi-lib
           cp ps3mapi-lib/include/ps3mapi_ps3_lib.h core/include/
           cp ps3mapi-lib/source/ps3mapi_ps3_lib.c core/libpcsxcore/
@@ -131,7 +140,7 @@ jobs:
           open(p, 'w', encoding='utf-8').write(s)
           print('__PSL1GHT__ define OK')
 
-          # 2. plugin.c: includes + page_table
+          # 2. plugin.c: includes + page_addr + local defines
           p = 'core/libpcsxcore/lightrec/plugin.c'
           s = open(p, encoding='utf-8').read()
           old_inc = '#include "mem.h"\n#include "plugin.h"'
@@ -140,12 +149,22 @@ jobs:
                      '#ifdef __PSL1GHT__\n'
                      '// PS3: malloc is NOT executable -> lightrec hangs.\n'
                      '// Use ps3mapi (Cobra/Mamba CFW syscall 8) for executable JIT pages.\n'
-                     '// NOTE: sys/process.h (sysProcessGetPid) is Sony SDK only;\n'
-                     '// PSL1GHT uses POSIX getpid() from <unistd.h> (already included).\n'
+                     '// DIVERIFIKASI 2026-10-07 dari header+source master ps3mapi-lib:\n'
+                     '//  - ps3mapi_process_page_free TIDAK ADA -> jangan panggil\n'
+                     '//  - output allocate = SATU u64 alamat (bukan 2-slot table)\n'
+                     '//  - PAGE_SIZE_AUTO TIDAK didefinisikan lib -> define lokal\n'
                      '#include "ps3mapi_ps3_lib.h"\n'
                      '#include <fcntl.h>\n'
                      '#include <string.h>\n'
-                     'static uint64_t lightrec_ps3_page_table[2] = {0, 0};\n'
+                     '#include <ppu-lv2.h>\n'
+                     '#define PS3_PAGE_SIZE_AUTO 0ULL  // UNVERIFIED: 0 = LV2 pilih page size;\n'
+                     '                                // kalau alloc gagal/hang, coba eksplisit 0x10000\n'
+                     '// getpid() BROKEN di PSL1GHT (return -1). Pakai LV2 syscall langsung.\n'
+                     '// sys_process_getpid = syscall 1 (no args, return pid).\n'
+                     'static int ps3_getpid(void) {\n'
+                     '   return (int)lv2syscall0(1);\n'
+                     '}\n'
+                     'static uint64_t lightrec_ps3_page_addr = 0;\n'
                      '// Unbuffered debug log (survives hard hangs - bypasses RetroArch logger)\n'
                      'static void ps3_dbglog(const char *msg) {\n'
                      '   int fd = open("/dev_hdd0/game/RETROARCH/USRDIR/ps3jit.log",\n'
@@ -172,25 +191,25 @@ jobs:
                        "\t\t// via ps3_jit_memory_available() probe.\n"
                        "\t\t{\n"
                        "\t\t\tchar dbgbuf[128];\n"
-                       "\t\t\tint pid = getpid();\n"
+                       "\t\t\tint pid = ps3_getpid();\n"
                        "\t\t\tsnprintf(dbgbuf, sizeof(dbgbuf),\n"
                        "\t\t\t\t \"ps3jit: plugin alloc start, pid=%d, size=%u\\n\",\n"
                        "\t\t\t\t pid, (unsigned)CODE_BUFFER_SIZE);\n"
                        "\t\t\tps3_dbglog(dbgbuf);\n"
                        "\t\t\tif (ps3mapi_process_page_allocate(pid,\n"
-                       "\t\t\t\t\t\t\tCODE_BUFFER_SIZE, PAGE_SIZE_AUTO,\n"
+                       "\t\t\t\t\t\t\tCODE_BUFFER_SIZE, PS3_PAGE_SIZE_AUTO,\n"
                        "\t\t\t\t\t\t\t0x2F, 1,\n"
-                       "\t\t\t\t\t\t\tlightrec_ps3_page_table) != 0 ||\n"
-                       "\t\t\t    !lightrec_ps3_page_table[0]) {\n"
+                       "\t\t\t\t\t\t\t&lightrec_ps3_page_addr) != 0 ||\n"
+                       "\t\t\t    !lightrec_ps3_page_addr) {\n"
                        "\t\t\t\tps3_dbglog(\"ps3jit: plugin alloc FAILED\\n\");\n"
                        "\t\t\t\tSysPrintf(\"lightrec: FATAL: ps3mapi page_allocate failed\\n\");\n"
                        "\t\t\t\treturn -ENOMEM;\n"
                        "\t\t\t}\n"
                        "\t\t\tsnprintf(dbgbuf, sizeof(dbgbuf),\n"
                        "\t\t\t\t \"ps3jit: plugin alloc OK @ %p\\n\",\n"
-                       "\t\t\t\t (void *)lightrec_ps3_page_table[0]);\n"
+                       "\t\t\t\t (void *)lightrec_ps3_page_addr);\n"
                        "\t\t\tps3_dbglog(dbgbuf);\n"
-                       "\t\t\tcode_buffer = (void *)lightrec_ps3_page_table[0];\n"
+                       "\t\t\tcode_buffer = (void *)lightrec_ps3_page_addr;\n"
                        "\t\t\tSysPrintf(\"lightrec: PS3 executable code buffer @ %p (ps3mapi OK)\\n\",\n"
                        "\t\t\t\t  code_buffer);\n"
                        "\t\t}\n"
@@ -211,11 +230,10 @@ jobs:
                       "static void lightrec_plugin_reset(void)")
           assert s.count(old_free) == 1, 'free anchor count=%d' % s.count(old_free)
           new_free = ("\t\t#ifdef __PSL1GHT__\n"
-                      "\t\tif (lightrec_ps3_page_table[0] && lightrec_ps3_page_table[1])\n"
-                      "\t\t\tps3mapi_process_page_free(getpid(), 0x2F,\n"
-                      "\t\t\t\t\t\t lightrec_ps3_page_table);\n"
-                      "\t\telse\n"
-                      "\t\t\tfree(code_buffer);\n"
+                      "\t\t// NO-OP: ps3mapi-lib tidak punya page_free (diverifikasi).\n"
+                      "\t\t// Halaman JIT sengaja tidak di-free (1x per game load).\n"
+                      "\t\t// JANGAN free(code_buffer) di sini — alamat ps3mapi bukan dari malloc.\n"
+                      "\t\t(void)code_buffer;\n"
                       "\t\t#else\n"
                       "\t\tfree(code_buffer);\n"
                       "\t\t#endif\n"
@@ -251,6 +269,12 @@ jobs:
               '#include "ps3mapi_ps3_lib.h"\n'
               '#include <fcntl.h>\n'
               '#include <string.h>\n'
+              '#include <ppu-lv2.h>\n'
+              "#define PS3_PAGE_SIZE_AUTO 0ULL  // UNVERIFIED: 0 = LV2 pilih page size\n"
+              "// getpid() BROKEN di PSL1GHT (return -1). Pakai LV2 syscall langsung.\n"
+              "static int ps3_getpid(void) {\n"
+              "   return (int)lv2syscall0(1); // sys_process_getpid\n"
+              "}\n"
               "static void ps3_probe_log(const char *msg) {\n"
               "   int fd = open(\"/dev_hdd0/game/RETROARCH/USRDIR/ps3jit.log\",\n"
               "                 O_WRONLY | O_CREAT | O_APPEND, 0644);\n"
@@ -261,24 +285,26 @@ jobs:
               "   static int checked = 0;\n"
               "   static int available = 0;\n"
               "   if (!checked) {\n"
-              "      uint64_t test_table[2] = {0, 0};\n"
-              "      int pid = getpid();\n"
+              "      uint64_t test_addr = 0;\n"
+              "      int pid = ps3_getpid();\n"
               "      char dbgbuf[128];\n"
               '      snprintf(dbgbuf, sizeof(dbgbuf), "ps3jit: probe start, pid=%d\\n", pid);\n'
               "      ps3_probe_log(dbgbuf);\n"
-              "      if (ps3mapi_process_page_allocate(pid, 4096,\n"
-              "                                        PAGE_SIZE_AUTO, 0x2F, 1,\n"
-              "                                        test_table) == 0 &&\n"
-              "          test_table[0]) {\n"
+              "      // Probe size = 650KB (sama seperti PicoDrive PS3 dynarec yang terbukti jalan).\n"
+              "      // 4KB dicurigai terlalu kecil untuk Cobra page allocator.\n"
+              "      if (ps3mapi_process_page_allocate(pid, 650 * 1024,\n"
+              "                                        PS3_PAGE_SIZE_AUTO, 0x2F, 1,\n"
+              "                                        &test_addr) == 0 &&\n"
+              "          test_addr) {\n"
               '         ps3_probe_log("ps3jit: probe alloc OK\\n");\n'
-              "         ps3mapi_process_page_free(pid, 0x2F, test_table);\n"
-              '         ps3_probe_log("ps3jit: probe free OK\\n");\n'
+              "         // TIDAK ada page_free di ps3mapi-lib (diverifikasi) ->\n"
+              "         // halaman probe 650KB sengaja dileak (sekali per boot).\n"
               "         available = 1;\n"
-              '         SysPrintf("ps3: ps3mapi executable memory OK - JIT available\\\\n");\n'
+              '         SysPrintf("ps3: ps3mapi executable memory OK - JIT available\\n");\n'
               "      }\n"
               "      else {\n"
               '         ps3_probe_log("ps3jit: probe FAILED\\n");\n'
-              '         SysPrintf("ps3: ps3mapi FAILED (no Cobra/Mamba?) - forcing interpreter\\\\n");\n'
+              '         SysPrintf("ps3: ps3mapi FAILED (no Cobra/Mamba?) - forcing interpreter\\n");\n'
               "      }\n"
               "      checked = 1;\n"
               "   }\n"
