@@ -135,6 +135,7 @@ jobs:
           set -eu
           SELF_NAME='pcsx_rearmed_libretro_ps3.SELF'
           PORT_DIR="${{ inputs.port_dir }}"
+          mkdir -p dist
           cp frontend/retroarch_psl1ght.self "dist/$SELF_NAME"
           {
             echo "core:     libretro/pcsx_rearmed @ $(cd core && git rev-parse --short HEAD)"
