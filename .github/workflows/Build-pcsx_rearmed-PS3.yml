@@ -320,7 +320,7 @@ jobs:
                      "\treturn val;\n"
                      "}\n"
                      "\n"
-                     "static const struct lightrec_mem_map_ops lightrec_ops = {")
+                     "static struct lightrec_mem_map_ops hw_regs_ops = {")
           assert s.count(old_ret) == 1, 'hw ret anchor count=%d' % s.count(old_ret)
           new_ret = ("\tlightrec_transition_from_pcsx(state);\n"
                      "#ifdef __PSL1GHT__\n"
@@ -340,7 +340,7 @@ jobs:
                      "\treturn val;\n"
                      "}\n"
                      "\n"
-                     "static const struct lightrec_mem_map_ops lightrec_ops = {")
+                     "static struct lightrec_mem_map_ops hw_regs_ops = {")
           s = s.replace(old_ret, new_ret)
           open(p, 'w', encoding='utf-8').write(s)
           print('plugin.c hw_read diagnostik OK')
