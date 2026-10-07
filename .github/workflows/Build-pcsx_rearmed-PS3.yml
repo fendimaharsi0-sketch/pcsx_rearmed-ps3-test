@@ -175,6 +175,8 @@ jobs:
                      '                 O_WRONLY | O_CREAT | O_APPEND, 0644);\n'
                      '   if (fd >= 0) { write(fd, msg, strlen(msg)); close(fd); }\n'
                      '}\n'
+                     '// Forward declaration (defined later, used by hw_read diagnostik)\n'
+                     'static void ps3_exec_log(const char *msg);\n'
                      '#if LIGHTREC_CODE_INV\n'
                      '// PS3 cache invalidation for JIT code (PPC dcbst/icbi).\n'
                      '// Required because ps3mapi-allocated pages are not\n'
