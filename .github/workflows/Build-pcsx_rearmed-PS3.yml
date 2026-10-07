@@ -12,8 +12,18 @@
 #     dynarec bisa dinyalakan via Core Options untuk ngetes fix.
 #     Alasan: lightrec + PS3 = hang saat load game (terbukti via tes
 #     interpreter; BIOS asli tidak menyelesaikan).
-#   - EKSPERIMEN FIX lightrec: -D__powerpc__ ditambahkan di block psl1ght
+#   - FIX lightrec (2026-10-07, breakthrough dari Fendi): malloc di PS3 TIDAK
+#     executable -> JIT hang. Solusi: code buffer via ps3mapi
+#     (Cobra/Mamba CFW syscall 8, is_executable=1).
+#     Ref: https://github.com/OsirizX/ps3mapi-lib
+#     Ref: https://github.com/irixxxx/picodrive/pull/82
+#     Fallback ke malloc + warning kalau ps3mapi gagal (bukan CFW).
+#     -D__PSL1GHT__ ditambahkan sebagai guard.
+#   - EKSPERIMEN: -D__powerpc__ ditambahkan di block psl1ght
 #     (Wii pakai -D__ppc__ -D__powerpc__). Harmless kalau redundan.
+#     CATATAN: TOC/OPD fix (PicoDrive PR #82) BELUM di-port ke lightning.
+#     Kalau masih crash (bukan hang) setelah executable memory, itu tersangka
+#     berikutnya.
 #   - BUILTIN_GPU default = peops (soft GPU, BUILTIN_GPU ?= peops)
 #   - CC = $(PS3DEV)/ppu/bin/ppu-gcc (butuh PS3DEV di env — di-set step Toolchain)
 # Target psl1ght TIDAK di-CI upstream -> build ini belum terverifikasi;
@@ -93,6 +103,102 @@ jobs:
           clone_ref https://github.com/libretro/pcsx_rearmed.git core "${{ inputs.core_ref }}"
           clone_ref https://github.com/libretro/RetroArch.git frontend "${{ inputs.frontend_ref }}"
 
+      - name: Patch core (PS3 executable JIT memory via ps3mapi)
+        # BREAKTHROUGH (2026-10-07, Fendi): malloc di PS3 TIDAK executable ->
+        # lightrec hang saat eksekusi kode JIT. Solusi: alokasi executable
+        # memory via ps3mapi (Cobra/Mamba CFW, syscall 8).
+        # Ref: https://github.com/OsirizX/ps3mapi-lib
+        # Ref: https://github.com/irixxxx/picodrive/pull/82 (PicoDrive PS3 dynarec)
+        # -D__PSL1GHT__ ditambahkan ke block psl1ght sebagai guard.
+        # Fallback: kalau ps3mapi gagal (bukan CFW Cobra), pakai malloc biasa
+        # + log warning (JIT akan hang, pakai interpreter).
+        run: |
+          set -eu
+          git clone --depth 1 --branch page_free \
+            https://github.com/OsirizX/ps3mapi-lib.git ps3mapi-lib
+          cp ps3mapi-lib/include/ps3mapi_ps3_lib.h core/include/
+          cp ps3mapi-lib/source/ps3mapi_ps3_lib.c core/libpcsxcore/
+          python3 - <<'EOF'
+          # 1. Makefile: tambah -D__PSL1GHT__ di block psl1ght
+          p = 'core/Makefile.libretro'
+          s = open(p, encoding='utf-8').read()
+          old = 'CFLAGS += -DBLARGG_BIG_ENDIAN=1 -D__ppc__ -D__powerpc__'
+          assert s.count(old) == 1, 'cflags count=%d' % s.count(old)
+          s = s.replace(old, old + ' -D__PSL1GHT__')
+          open(p, 'w', encoding='utf-8').write(s)
+          print('__PSL1GHT__ define OK')
+
+          # 2. plugin.c: includes + page_table
+          p = 'core/libpcsxcore/lightrec/plugin.c'
+          s = open(p, encoding='utf-8').read()
+          old_inc = '#include "mem.h"\n#include "plugin.h"'
+          assert s.count(old_inc) == 1, 'inc anchor count=%d' % s.count(old_inc)
+          new_inc = ('#include "mem.h"\n#include "plugin.h"\n'
+                     '#ifdef __PSL1GHT__\n'
+                     '// PS3: malloc is NOT executable -> lightrec hangs.\n'
+                     '// Use ps3mapi (Cobra/Mamba CFW syscall 8) for executable JIT pages.\n'
+                     '#include <sys/process.h>\n'
+                     '#include "ps3mapi_ps3_lib.h"\n'
+                     'static uint64_t lightrec_ps3_page_table[2] = {0, 0};\n'
+                     '#endif')
+          s = s.replace(old_inc, new_inc)
+          print('plugin.c includes OK')
+
+          # 3. plugin.c: code_buffer allocation via ps3mapi
+          old_alloc = ("\t\tcode_buffer = malloc(CODE_BUFFER_SIZE);\n"
+                       "\t\tif (!code_buffer)\n"
+                       "\t\t\treturn -ENOMEM;")
+          assert s.count(old_alloc) == 1, 'alloc anchor count=%d' % s.count(old_alloc)
+          new_alloc = ("\t\t#ifdef __PSL1GHT__\n"
+                       "\t\t// PS3 executable JIT memory (requires Cobra/Mamba CFW)\n"
+                       "\t\tif (ps3mapi_process_page_allocate(sysProcessGetPid(),\n"
+                       "\t\t\t\t\t\tCODE_BUFFER_SIZE, PAGE_SIZE_AUTO,\n"
+                       "\t\t\t\t\t\t0x2F, 1,\n"
+                       "\t\t\t\t\t\tlightrec_ps3_page_table) == 0 &&\n"
+                       "\t\t    lightrec_ps3_page_table[0]) {\n"
+                       "\t\t\tcode_buffer = (void *)lightrec_ps3_page_table[0];\n"
+                       "\t\t\tSysPrintf(\"lightrec: PS3 executable code buffer @ %p (ps3mapi OK)\\n\",\n"
+                       "\t\t\t\t  code_buffer);\n"
+                       "\t\t} else {\n"
+                       "\t\t\tSysPrintf(\"lightrec: ps3mapi FAILED (no Cobra/Mamba?), \"\n"
+                       "\t\t\t\t  \"malloc fallback - JIT will hang, use interpreter\\n\");\n"
+                       "\t\t\tcode_buffer = malloc(CODE_BUFFER_SIZE);\n"
+                       "\t\t}\n"
+                       "\t\t#else\n"
+                       "\t\tcode_buffer = malloc(CODE_BUFFER_SIZE);\n"
+                       "\t\t#endif\n"
+                       "\t\tif (!code_buffer)\n"
+                       "\t\t\treturn -ENOMEM;")
+          s = s.replace(old_alloc, new_alloc)
+          print('plugin.c alloc OK')
+
+          # 4. plugin.c: cleanup via ps3mapi
+          old_free = ("\t\tfree(code_buffer);\n"
+                      "#endif\n"
+                      "\t}\n"
+                      "}\n"
+                      "\n"
+                      "static void lightrec_plugin_reset(void)")
+          assert s.count(old_free) == 1, 'free anchor count=%d' % s.count(old_free)
+          new_free = ("\t\t#ifdef __PSL1GHT__\n"
+                      "\t\tif (lightrec_ps3_page_table[0] && lightrec_ps3_page_table[1])\n"
+                      "\t\t\tps3mapi_process_page_free(sysProcessGetPid(), 0x2F,\n"
+                      "\t\t\t\t\t\t lightrec_ps3_page_table);\n"
+                      "\t\telse\n"
+                      "\t\t\tfree(code_buffer);\n"
+                      "\t\t#else\n"
+                      "\t\tfree(code_buffer);\n"
+                      "\t\t#endif\n"
+                      "#endif\n"
+                      "\t}\n"
+                      "}\n"
+                      "\n"
+                      "static void lightrec_plugin_reset(void)")
+          s = s.replace(old_free, new_free)
+          open(p, 'w', encoding='utf-8').write(s)
+          print('plugin.c free OK')
+          EOF
+
       - name: Patch core (drc default off + PPC define)
         # 1. pcsx_rearmed_drc default -> "disabled": tiap build baru langsung
         #    jalan (interpreter) tanpa config custom tambahan; dynarec tetap
@@ -164,6 +270,15 @@ jobs:
           set -eu
           cd core
           make -f Makefile.libretro platform=psl1ght -j"$(nproc)" V=1
+          # Compile ps3mapi (PS3 executable memory) dan gabung ke archive.
+          # Include path: PSL1GHT headers + core/include (ps3mapi_ps3_lib.h).
+          PSL1GHT_INC="${PSL1GHT:-/usr/local/ps3dev}/include"
+          if [ ! -d "$PSL1GHT_INC" ]; then PSL1GHT_INC="/opt/ps3dev/include"; fi
+          "$PS3DEV/ppu/bin/ppu-gcc" -O2 -D__PSL1GHT__ \
+            -I"$PSL1GHT_INC" -Iinclude \
+            -c libpcsxcore/ps3mapi_ps3_lib.c -o libpcsxcore/ps3mapi_ps3_lib.o
+          ppu-ar rcs pcsx_rearmed_libretro_psl1ght.a libpcsxcore/ps3mapi_ps3_lib.o
+          ppu-ar t pcsx_rearmed_libretro_psl1ght.a | grep -i ps3mapi
           ls -la pcsx_rearmed_libretro_psl1ght.a
 
       - name: Link frontend + core, make SELF
@@ -225,9 +340,14 @@ jobs:
             echo "  5. Launch dari menu CE seperti core biasa."
             echo ""
             echo "CATATAN: dynarec default = DISABLED (interpreter) di build ini."
-            echo "Game langsung jalan tanpa config tambahan. Untuk ngetes"
-            echo "lightrec (+ eksperimen -D__powerpc__), nyalakan via"
-            echo "Quick Menu -> Options -> Dynamic Recompiler."
+            echo "Game langsung jalan tanpa config tambahan."
+            echo ""
+            echo "FIX lightrec (eksperimental): code buffer JIT sekarang pakai"
+            echo "ps3mapi (executable memory, butuh CFW Cobra/Mamba)."
+            echo "Untuk ngetes: nyalakan Quick Menu -> Options -> Dynamic"
+            echo "Recompiler = enabled. Cek log (log_to_file=true):"
+            echo "  'ps3mapi OK' -> alokasi berhasil, lihat apakah masih hang/crash"
+            echo "  'ps3mapi FAILED' -> bukan CFW Cobra, tetap pakai interpreter."
           } > dist/BUILD_INFO.txt
           find dist -type f | sort
 
