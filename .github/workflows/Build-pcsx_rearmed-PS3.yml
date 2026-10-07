@@ -161,9 +161,11 @@ jobs:
                      '#define PS3_PAGE_SIZE_AUTO 0ULL  // UNVERIFIED: 0 = LV2 pilih page size;\n'
                      '                                // kalau alloc gagal/hang, coba eksplisit 0x10000\n'
                      '// getpid() BROKEN di PSL1GHT (return -1). Pakai LV2 syscall langsung.\n'
-                     '// sys_process_getpid = syscall 1 (no args, return pid).\n'
+                     '// sys_process_getpid = syscall 1. Pakai lv2syscall8 (terbukti jalan\n'
+                     '// di ps3mapi_lib.c) dengan argumen nol — macro lv2syscall0 bermasalah.\n'
                      'static int ps3_getpid(void) {\n'
-                     '   return (int)lv2syscall0(1);\n'
+                     '   uint64_t pid = lv2syscall8(1, 0, 0, 0, 0, 0, 0, 0);\n'
+                     '   return (int)pid;\n'
                      '}\n'
                      'static uint64_t lightrec_ps3_page_addr = 0;\n'
                      '// Unbuffered debug log (survives hard hangs - bypasses RetroArch logger)\n'
@@ -274,7 +276,8 @@ jobs:
               "#define PS3_PAGE_SIZE_AUTO 0ULL  // UNVERIFIED: 0 = LV2 pilih page size\n"
               "// getpid() BROKEN di PSL1GHT (return -1). Pakai LV2 syscall langsung.\n"
               "static int ps3_getpid(void) {\n"
-              "   return (int)lv2syscall0(1); // sys_process_getpid\n"
+              "   uint64_t pid = lv2syscall8(1, 0, 0, 0, 0, 0, 0, 0); // sys_process_getpid\n"
+              "   return (int)pid;\n"
               "}\n"
               "static void ps3_probe_log(const char *msg) {\n"
               "   int fd = open(\"/dev_hdd0/game/RETROARCH/USRDIR/ps3jit.log\",\n"
