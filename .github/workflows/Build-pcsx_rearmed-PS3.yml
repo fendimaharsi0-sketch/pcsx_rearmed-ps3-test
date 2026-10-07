@@ -139,7 +139,8 @@ jobs:
                      '#ifdef __PSL1GHT__\n'
                      '// PS3: malloc is NOT executable -> lightrec hangs.\n'
                      '// Use ps3mapi (Cobra/Mamba CFW syscall 8) for executable JIT pages.\n'
-                     '#include <sys/process.h>\n'
+                     '// NOTE: sys/process.h (sysProcessGetPid) is Sony SDK only;\n'
+                     '// PSL1GHT uses POSIX getpid() from <unistd.h> (already included).\n'
                      '#include "ps3mapi_ps3_lib.h"\n'
                      'static uint64_t lightrec_ps3_page_table[2] = {0, 0};\n'
                      '#endif')
@@ -153,7 +154,7 @@ jobs:
           assert s.count(old_alloc) == 1, 'alloc anchor count=%d' % s.count(old_alloc)
           new_alloc = ("\t\t#ifdef __PSL1GHT__\n"
                        "\t\t// PS3 executable JIT memory (requires Cobra/Mamba CFW)\n"
-                       "\t\tif (ps3mapi_process_page_allocate(sysProcessGetPid(),\n"
+                       "\t\tif (ps3mapi_process_page_allocate(getpid(),\n"
                        "\t\t\t\t\t\tCODE_BUFFER_SIZE, PAGE_SIZE_AUTO,\n"
                        "\t\t\t\t\t\t0x2F, 1,\n"
                        "\t\t\t\t\t\tlightrec_ps3_page_table) == 0 &&\n"
@@ -184,7 +185,7 @@ jobs:
           assert s.count(old_free) == 1, 'free anchor count=%d' % s.count(old_free)
           new_free = ("\t\t#ifdef __PSL1GHT__\n"
                       "\t\tif (lightrec_ps3_page_table[0] && lightrec_ps3_page_table[1])\n"
-                      "\t\t\tps3mapi_process_page_free(sysProcessGetPid(), 0x2F,\n"
+                      "\t\t\tps3mapi_process_page_free(getpid(), 0x2F,\n"
                       "\t\t\t\t\t\t lightrec_ps3_page_table);\n"
                       "\t\telse\n"
                       "\t\t\tfree(code_buffer);\n"
