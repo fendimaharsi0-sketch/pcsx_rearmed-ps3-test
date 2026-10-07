@@ -416,7 +416,10 @@ jobs:
         run: |
           set -eu
           cd core
-          make -f Makefile.libretro platform=psl1ght -j"$(nproc)" V=1
+          # LIGHTREC_CODE_INV=1: PS3 (seperti Wii U) butuh explicit cache
+          # invalidation setelah nulis JIT code (PPC dcbst/icbi).
+          # Tanpa ini, CPU eksekusi instruksi basi -> hang.
+          make -f Makefile.libretro platform=psl1ght LIGHTREC_CODE_INV=1 -j"$(nproc)" V=1
           # Compile ps3mapi (PS3 executable memory) dan gabung ke archive.
           # Include path: PSL1GHT headers (ppu-lv2.h ada di ppu/include) +
           # core/include (ps3mapi_ps3_lib.h).
