@@ -23,8 +23,7 @@
 #   - EKSPERIMEN: -D__powerpc__ ditambahkan di block psl1ght
 #     (Wii pakai -D__ppc__ -D__powerpc__). Harmless kalau redundan.
 #     CATATAN: TOC/OPD fix (PicoDrive PR #82) di-port ke Lightning
-#     jit_ppc-cpu.c (_callr) pada 2026-10-07. Kalau masih hang, tersangka
-#     berikutnya = hal lain di backend PPC64 Lightning.
+#     jit_ppc-cpu.c (_callr + _calli) pada 2026-10-07.
 #   - BUILTIN_GPU default = peops (soft GPU, BUILTIN_GPU ?= peops)
 #   - CC = $(PS3DEV)/ppu/bin/ppu-gcc (butuh PS3DEV di env — di-set step Toolchain)
 # Target psl1ght TIDAK di-CI upstream -> build ini belum terverifikasi;
@@ -105,34 +104,14 @@ jobs:
           clone_ref https://github.com/libretro/RetroArch.git frontend "${{ inputs.frontend_ref }}"
 
       - name: Patch core (PS3 executable JIT memory via ps3mapi)
-        # BREAKTHROUGH (2026-10-07, Fendi): malloc di PS3 TIDAK executable ->
-        # lightrec hang saat eksekusi kode JIT. Solusi: alokasi executable
-        # memory via ps3mapi (Cobra/Mamba CFW, syscall 8).
-        # Ref API client: https://github.com/OsirizX/ps3mapi-lib (master SAJA —
-        #   diverifikasi 2026-10-07: tidak ada branch page_free; TIDAK ada
-        #   ps3mapi_process_page_free di lib ini — jangan pernah panggil)
-        # Ref payload (Cobra side): https://github.com/osirizx/mamba
-        #   stage2/ps3mapi_core.c :: ps3mapi_process_page_allocate
-        #   (TheRouletteBoi, Mamba/Cobra 8.2+; opcode 0x0033; output = SATU u64
-        #   alamat via copy_to_user, bukan 2-slot table; page_size diteruskan
-        #   ke page_allocate() LV2 apa adanya; pid salah -> return ESRCH)
-        # CATATAN: irixxxx/picodrive#82 = fix TOC/OPD emitter PPC (bukan ps3mapi).
-        # -D__PSL1GHT__ ditambahkan ke block psl1ght sebagai guard.
-        # Fallback: kalau ps3mapi gagal, return -ENOMEM (TIDAK PERNAH malloc —
-        # Fendi: malloc pasti hang); libretro.c probe paksa interpreter.
         run: |
           set -eu
-          # NOTE: repo ps3mapi-lib cuma punya branch master (tidak ada page_free,
-          # diverifikasi 2026-10-07 via GitHub branches API).
           git clone --depth 1 \
             https://github.com/OsirizX/ps3mapi-lib.git ps3mapi-lib
           cp ps3mapi-lib/include/ps3mapi_ps3_lib.h core/include/
           cp ps3mapi-lib/source/ps3mapi_ps3_lib.c core/libpcsxcore/
           python3 - <<'EOF'
           # 1. Makefile: tambah -D__PSL1GHT__ di block psl1ght
-          # NOTE: step ini jalan SEBELUM step "drc default off", jadi anchor
-          # masih baris original tanpa -D__powerpc__.
-          # Juga tambah -I$(PS3DEV)/ppu/include untuk ppu-lv2.h (lv2syscall).
           p = 'core/Makefile.libretro'
           s = open(p, encoding='utf-8').read()
           old = 'CFLAGS += -DBLARGG_BIG_ENDIAN=1 -D__ppc__'
@@ -148,37 +127,23 @@ jobs:
           assert s.count(old_inc) == 1, 'inc anchor count=%d' % s.count(old_inc)
           new_inc = ('#include "mem.h"\n#include "plugin.h"\n'
                      '#ifdef __PSL1GHT__\n'
-                     '// PS3: malloc is NOT executable -> lightrec hangs.\n'
-                     '// Use ps3mapi (Cobra/Mamba CFW syscall 8) for executable JIT pages.\n'
-                     '// DIVERIFIKASI 2026-10-07 dari header+source master ps3mapi-lib:\n'
-                     '//  - ps3mapi_process_page_free TIDAK ADA -> jangan panggil\n'
-                     '//  - output allocate = SATU u64 alamat (bukan 2-slot table)\n'
-                     '//  - PAGE_SIZE_AUTO TIDAK didefinisikan lib -> define lokal\n'
                      '#include "ps3mapi_ps3_lib.h"\n'
                      '#include <fcntl.h>\n'
                      '#include <stdint.h>\n'
                      '#include <string.h>\n'
                      '#include <ppu-lv2.h>\n'
-                     '#define PS3_PAGE_SIZE_AUTO 0ULL  // UNVERIFIED: 0 = LV2 pilih page size;\n'
-                     '                                // kalau alloc gagal/hang, coba eksplisit 0x10000\n'
-                     '// getpid() BROKEN di PSL1GHT (return -1). Pakai LV2 syscall langsung.\n'
-                     '// sys_process_getpid = syscall 1. Pakai lv2syscall8 (terbukti jalan\n'
-                     '// di ps3mapi_lib.c) dengan argumen nol — macro lv2syscall0 bermasalah.\n'
+                     '#define PS3_PAGE_SIZE_AUTO 0ULL\n'
                      'static int ps3_getpid(void) {\n'
                      '   lv2syscall8(1, 0, 0, 0, 0, 0, 0, 0, 0);\n'
                      '   return_to_user_prog(int);\n'
                      '}\n'
                      'static uint64_t lightrec_ps3_page_addr = 0;\n'
-                     '// Unbuffered debug log (survives hard hangs - bypasses RetroArch logger)\n'
                      'static void ps3_dbglog(const char *msg) {\n'
                      '   int fd = open("/dev_hdd0/game/RETROARCH/USRDIR/ps3jit.log",\n'
                      '                 O_WRONLY | O_CREAT | O_APPEND, 0644);\n'
                      '   if (fd >= 0) { write(fd, msg, strlen(msg)); close(fd); }\n'
                      '}\n'
                      '#if LIGHTREC_CODE_INV\n'
-                     '// PS3 cache invalidation for JIT code (PPC dcbst/icbi).\n'
-                     '// Required because ps3mapi-allocated pages are not\n'
-                     '// automatically coherent. Same pattern as Wii U mem_wiiu.c.\n'
                      'void lightrec_code_inv(void *ptr, uint32_t len) {\n'
                      '   uintptr_t start = (uintptr_t)ptr & ~127UL;\n'
                      '   uintptr_t end = (uintptr_t)ptr + len;\n'
@@ -196,19 +161,11 @@ jobs:
           print('plugin.c includes OK')
 
           # 3. plugin.c: code_buffer allocation via ps3mapi
-          # Fendi: JANGAN PERNAH fallback ke malloc biasa (pasti hang).
-          # Kalau ps3mapi gagal di sini, return error (tidak boleh hang diam-diam).
-          # Fallback ke interpreter sudah ditangani di libretro.c (probe).
-          # Debug: unbuffered log ke ps3jit.log (survive hard hang).
           old_alloc = ("\t\tcode_buffer = malloc(CODE_BUFFER_SIZE);\n"
                        "\t\tif (!code_buffer)\n"
                        "\t\t\treturn -ENOMEM;")
           assert s.count(old_alloc) == 1, 'alloc anchor count=%d' % s.count(old_alloc)
           new_alloc = ("\t\t#ifdef __PSL1GHT__\n"
-                       "\t\t// PS3 executable JIT memory (requires Cobra/Mamba CFW).\n"
-                       "\t\t// NEVER fall back to malloc here - it WILL hang. If ps3mapi\n"
-                       "\t\t// fails, return error; libretro.c already forces interpreter\n"
-                       "\t\t// via ps3_jit_memory_available() probe.\n"
                        "\t\t{\n"
                        "\t\t\tchar dbgbuf[128];\n"
                        "\t\t\tint pid = ps3_getpid();\n"
@@ -222,7 +179,6 @@ jobs:
                        "\t\t\t\t\t\t\t&lightrec_ps3_page_addr) != 0 ||\n"
                        "\t\t\t    !lightrec_ps3_page_addr) {\n"
                        "\t\t\t\tps3_dbglog(\"ps3jit: plugin alloc FAILED\\n\");\n"
-                       "\t\t\t\tSysPrintf(\"lightrec: FATAL: ps3mapi page_allocate failed\\n\");\n"
                        "\t\t\t\treturn -ENOMEM;\n"
                        "\t\t\t}\n"
                        "\t\t\tsnprintf(dbgbuf, sizeof(dbgbuf),\n"
@@ -241,7 +197,7 @@ jobs:
           s = s.replace(old_alloc, new_alloc)
           print('plugin.c alloc OK')
 
-          # 4. plugin.c: cleanup via ps3mapi
+          # 4. plugin.c: cleanup (no-op, no page_free API)
           old_free = ("\t\tfree(code_buffer);\n"
                       "#endif\n"
                       "\t}\n"
@@ -250,9 +206,6 @@ jobs:
                       "static void lightrec_plugin_reset(void)")
           assert s.count(old_free) == 1, 'free anchor count=%d' % s.count(old_free)
           new_free = ("\t\t#ifdef __PSL1GHT__\n"
-                      "\t\t// NO-OP: ps3mapi-lib tidak punya page_free (diverifikasi).\n"
-                      "\t\t// Halaman JIT sengaja tidak di-free (1x per game load).\n"
-                      "\t\t// JANGAN free(code_buffer) di sini — alamat ps3mapi bukan dari malloc.\n"
                       "\t\t(void)code_buffer;\n"
                       "\t\t#else\n"
                       "\t\tfree(code_buffer);\n"
@@ -266,9 +219,7 @@ jobs:
           open(p, 'w', encoding='utf-8').write(s)
           print('plugin.c free OK')
 
-          # 5. plugin.c: heartbeat log di execute (diagnosis hang: compile vs exec)
-          # Kalau "execute start" muncul tapi hang, berarti di dalam lightrec_execute.
-          # Kalau tidak muncul sama sekali, hang sebelum execute dipanggil.
+          # 5. plugin.c: heartbeat log di execute
           p = 'core/libpcsxcore/lightrec/plugin.c'
           s = open(p, encoding='utf-8').read()
           old_exec = "static void lightrec_plugin_execute_internal(bool block_only)"
@@ -302,19 +253,13 @@ jobs:
           EOF
 
       - name: Patch Lightning (PS3 function descriptor / TOC)
-        # ROOT CAUSE (2026-10-07): Lightning's _callr() tidak handle PS3
-        # function descriptor. _CALL_AIXDESC cuma aktif buat AIX, bukan PS3.
-        # Akibat: indirect call ke C helper loncat ke descriptor (data),
-        # bukan ke alamat kode -> hang.
-        # Fix: port pola irixxxx/picodrive#82 ke jit_ppc-cpu.c.
-        # PS3 descriptor = [addr, toc] (16 byte), bukan 24 byte kayak AIX.
         run: |
           set -eu
           python3 - <<'EOF'
           p = 'core/deps/lightning/lib/jit_ppc-cpu.c'
           s = open(p, encoding='utf-8').read()
 
-          # 1. _callr(): tambah PS3 descriptor handling sebelum _CALL_AIXDESC
+          # 1. _callr(): PS3 descriptor handling
           old_call = ("       )\n"
                       "{\n"
                       "#  if _CALL_AIXDESC\n"
@@ -323,11 +268,6 @@ jobs:
           new_call = ("       )\n"
                       "{\n"
                       "#  if defined(__PSL1GHT__) || defined(__PS3__) || defined(__powerpc64__)\n"
-                      "    /* PS3/PPC64: function descriptor = [addr, toc] (16 bytes).\n"
-                      "     * NOT 24 bytes like AIX. Load TOC from [r0+8] -> r2,\n"
-                      "     * addr from [r0] -> r0. Port of irixxxx/picodrive#82.\n"
-                      "     * __powerpc64__ = compiler-defined, robust kalau\n"
-                      "     * __PSL1GHT__ tidak propagate ke Lightning. */\n"
                       "    stxi(sizeof(void*) * 5, _SP_REGNO, _R2_REGNO);\n"
                       "    if (r0 == _R0_REGNO) {\n"
                       "        movr(_R11_REGNO, _R0_REGNO);\n"
@@ -344,7 +284,7 @@ jobs:
           s = s.replace(old_call, new_call)
           print('_callr PS3 descriptor OK')
 
-          # 2. _callr(): restore r2 juga buat PS3 (bukan cuma AIX)
+          # 2. _callr(): restore r2 buat PS3
           old_restore = ("#  if _CALL_AIXDESC\n"
                          "    ldxi(_R2_REGNO, _SP_REGNO, sizeof(void*) * 5);\n"
                          "#  endif\n"
@@ -359,35 +299,45 @@ jobs:
                          "\n"
                          "/* assume fixed address or reachable address */")
           s = s.replace(old_restore, new_restore)
-          open(p, 'w', encoding='utf-8').write(s)
           print('_callr r2 restore OK')
+
+          # 3. _calli(): paksa lewat callr di PS3 (jangan BL langsung)
+          old_calli = ("    jit_word_t\t\tw;\n"
+                       "#  if _CALL_SYSV\n"
+                       "    jit_word_t\t\td;\n"
+                       "    d = (i0 - _jit->pc.w - !!varargs * 4) & ~3;\n"
+                       "    if (can_sign_extend_jump_p(d)) {")
+          assert s.count(old_calli) == 1, 'calli anchor count=%d' % s.count(old_calli)
+          new_calli = ("    jit_word_t\t\tw;\n"
+                       "#  if _CALL_SYSV\n"
+                       "    jit_word_t\t\td;\n"
+                       "#   if defined(__PSL1GHT__) || defined(__PS3__) || defined(__powerpc64__)\n"
+                       "    (void)d;\n"
+                       "    if (0) {\n"
+                       "#   else\n"
+                       "    d = (i0 - _jit->pc.w - !!varargs * 4) & ~3;\n"
+                       "    if (can_sign_extend_jump_p(d)) {\n"
+                       "#   endif")
+          s = s.replace(old_calli, new_calli)
+          open(p, 'w', encoding='utf-8').write(s)
+          print('_calli PS3 force-callr OK')
           EOF
 
       - name: Patch core (PS3 JIT fallback to interpreter)
-        # Kalau ps3mapi tidak tersedia (bukan CFW Cobra/Mamba), paksa
-        # interpreter — jangan coba lightrec (akan hang). Pola sama seperti
-        # 3DS (__ctr_svchax check).
-        # Probe dilakukan sekali (cached) saat opsi DRC dibaca.
         run: |
           set -eu
           python3 - <<'EOF'
           p = 'core/frontend/libretro.c'
           s = open(p, encoding='utf-8').read()
-
-          # 1. Helper function sebelum retro_load_game
           old_func = "bool retro_load_game(const struct retro_game_info *info)"
           assert s.count(old_func) == 1, 'func count=%d' % s.count(old_func)
           helper = (
               "#ifdef __PSL1GHT__\n"
-              "// PS3: JIT needs executable memory via ps3mapi (Cobra/Mamba CFW).\n"
-              "// Probe once and cache. If unavailable, force interpreter\n"
-              "// (same pattern as 3DS __ctr_svchax check).\n"
               '#include "ps3mapi_ps3_lib.h"\n'
               '#include <fcntl.h>\n'
               '#include <string.h>\n'
               '#include <ppu-lv2.h>\n'
-              "#define PS3_PAGE_SIZE_AUTO 0ULL  // UNVERIFIED: 0 = LV2 pilih page size\n"
-              "// getpid() BROKEN di PSL1GHT (return -1). Pakai LV2 syscall langsung.\n"
+              "#define PS3_PAGE_SIZE_AUTO 0ULL\n"
               "static int ps3_getpid(void) {\n"
               "   lv2syscall8(1, 0, 0, 0, 0, 0, 0, 0, 0);\n"
               "   return_to_user_prog(int);\n"
@@ -407,15 +357,11 @@ jobs:
               "      char dbgbuf[128];\n"
               '      snprintf(dbgbuf, sizeof(dbgbuf), "ps3jit: probe start, pid=%d\\n", pid);\n'
               "      ps3_probe_log(dbgbuf);\n"
-              "      // Probe size = 650KB (sama seperti PicoDrive PS3 dynarec yang terbukti jalan).\n"
-              "      // 4KB dicurigai terlalu kecil untuk Cobra page allocator.\n"
               "      if (ps3mapi_process_page_allocate(pid, 650 * 1024,\n"
               "                                        PS3_PAGE_SIZE_AUTO, 0x2F, 1,\n"
               "                                        &test_addr) == 0 &&\n"
               "          test_addr) {\n"
               '         ps3_probe_log("ps3jit: probe alloc OK\\n");\n'
-              "         // TIDAK ada page_free di ps3mapi-lib (diverifikasi) ->\n"
-              "         // halaman probe 650KB sengaja dileak (sekali per boot).\n"
               "         available = 1;\n"
               '         SysPrintf("ps3: ps3mapi executable memory OK - JIT available\\n");\n'
               "      }\n"
@@ -432,8 +378,6 @@ jobs:
               "bool retro_load_game(const struct retro_game_info *info)")
           s = s.replace(old_func, helper)
           print('ps3_jit_memory_available helper OK')
-
-          # 2. Force interpreter kalau ps3mapi tidak tersedia (pola 3DS)
           old_drc = ("#ifdef _3DS\n"
                      "      if (!__ctr_svchax)\n"
                      "         Config.Cpu = CPU_INTERPRETER;\n"
@@ -458,13 +402,6 @@ jobs:
           EOF
 
       - name: Patch core (drc default off + PPC define)
-        # 1. pcsx_rearmed_drc default -> "disabled": tiap build baru langsung
-        #    jalan (interpreter) tanpa config custom tambahan; dynarec tetap
-        #    bisa dinyalakan via Core Options kalau mau ngetes fix.
-        #    (Fendi: "dyna default mati aja".)
-        # 2. -D__powerpc__ di block psl1ght (eksperimen fix lightrec; target Wii
-        #    pakai -D__ppc__ -D__powerpc__, psl1ght cuma -D__ppc__. Kemungkinan
-        #    sudah implisit dari compiler — harmless kalau redundant.)
         run: |
           set -eu
           python3 - <<'EOF'
@@ -479,11 +416,8 @@ jobs:
           s = s[:i] + seg + s[i+1500:]
           open(p, 'w', encoding='utf-8').write(s)
           print('drc default -> disabled OK')
-
           p = 'core/Makefile.libretro'
           s = open(p, encoding='utf-8').read()
-          # NOTE: step ps3mapi sudah jalan duluan dan nambah -D__PSL1GHT__
-          # + -I$(PS3DEV)/ppu/include, jadi anchor di sini termasuk itu.
           old = 'CFLAGS += -DBLARGG_BIG_ENDIAN=1 -D__ppc__ -D__PSL1GHT__ -I$(PS3DEV)/ppu/include'
           assert s.count(old) == 1, 'ppc cflags count=%d' % s.count(old)
           s = s.replace(old, old + ' -D__powerpc__')
@@ -510,32 +444,17 @@ jobs:
           assert s.count(anchor) == 1, 'anchor count=%d' % s.count(anchor)
           patch = ("      case CMD_EVENT_UNLOAD_CORE:\n"
                    "         {\n"
-                   "            /* CE-style return-to-menu (port of CE RetroArchPatch.sh):\n"
-                   "               static core can't truly unload in-process;\n"
-                   "               reboot the SELF into its own menu instead of\n"
-                   "               exiting to XMB. */\n"
                    "            command_event(CMD_EVENT_RESTART_RETROARCH, NULL);\n"
                    "            break;\n")
           open(p, 'w', encoding='utf-8').write(s.replace(anchor, patch))
           print('return-to-menu patch OK')
           EOF
-          grep -n -A4 'CE-style return-to-menu' frontend/retroarch.c | head -8
 
       - name: Build core (static lib)
-        # Makefile.libretro nge-print TARGET/platform/ARCH/DYNAREC/BUILTIN_GPU
-        # di awal — verifikasi di log: DYNAREC harusnya "lightrec",
-        # BUILTIN_GPU "peops". Kalau DYNAREC kosong/jatuh ke interpreter,
-        # lapor log-nya.
         run: |
           set -eu
           cd core
-          # LIGHTREC_CODE_INV=1: PS3 (seperti Wii U) butuh explicit cache
-          # invalidation setelah nulis JIT code (PPC dcbst/icbi).
-          # Tanpa ini, CPU eksekusi instruksi basi -> hang.
           make -f Makefile.libretro platform=psl1ght LIGHTREC_CODE_INV=1 -j"$(nproc)" V=1
-          # Compile ps3mapi (PS3 executable memory) dan gabung ke archive.
-          # Include path: PSL1GHT headers (ppu-lv2.h ada di ppu/include) +
-          # core/include (ps3mapi_ps3_lib.h).
           PPU_INC="${PS3DEV}/ppu/include"
           GEN_INC="${PSL1GHT:-/usr/local/ps3dev}/include"
           "$PS3DEV/ppu/bin/ppu-gcc" -O2 -D__PSL1GHT__ \
@@ -554,11 +473,6 @@ jobs:
           ls -la retroarch_psl1ght.self
 
       - name: Fetch menu assets (RGUI)
-        # RGUI tidak butuh PNG ikon (semuanya digambar prosedural) — yang
-        # dibundle cuma theme .cfg (~500 byte per file). Fendi: "aset make
-        # r-gui saja".
-        # NOTE: theme ini cuma kepakai kalau menu_driver = "rgui" di
-        # retroarch.cfg (config kita sharing dengan CE — set manual).
         run: |
           set -eu
           rm -rf assets-src
@@ -585,33 +499,11 @@ jobs:
           PORT_DIR="${{ inputs.port_dir }}"
           cp frontend/retroarch_psl1ght.self "dist/$SELF_NAME"
           {
-            echo "core:     libretro/pcsx_rearmed @ $(cd core && git rev-parse --short HEAD) ($(cd core && git log -1 --format=%cd --date=short))"
-            echo "frontend: libretro/RetroArch @ $(cd frontend && git rev-parse --short HEAD) ($(cd frontend && git log -1 --format=%cd --date=short))"
-            echo "assets:   libretro/retroarch-assets @ $(cd assets-src && git rev-parse --short HEAD) (rgui themes)"
-            echo "port_dir: $PORT_DIR (sharing config/aset/save dengan CE)"
+            echo "core:     libretro/pcsx_rearmed @ $(cd core && git rev-parse --short HEAD)"
+            echo "frontend: libretro/RetroArch @ $(cd frontend && git rev-parse --short HEAD)"
             echo "built:    $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo ""
-            echo "INSTALL DI PS3 (via menu CE):"
-            echo "  1. BACKUP dulu /dev_hdd0/game/$PORT_DIR/USRDIR/retroarch.cfg (jaga-jaga)"
-            echo "  2. $SELF_NAME -> /dev_hdd0/game/$PORT_DIR/USRDIR/cores/ (FTP)"
-            echo "  3. aset RGUI: copy isi folder assets/rgui/ ke"
-            echo "     /dev_hdd0/game/$PORT_DIR/USRDIR/assets/rgui/."
-            echo "     Lalu set menu_driver = \"rgui\" di retroarch.cfg"
-            echo "     (theme .cfg cuma kepakai di driver rgui)."
-            echo "  4. BIOS PS1 ASLI (wajib!): Lightrec tidak jalan dengan HLE BIOS."
-            echo "     Taruh scph5500/scph5501/scph5502.bin di system dir"
-            echo "     (/dev_hdd0/game/$PORT_DIR/USRDIR/system/)."
-            echo "  5. Launch dari menu CE seperti core biasa."
-            echo ""
-            echo "CATATAN: dynarec default = DISABLED (interpreter) di build ini."
-            echo "Game langsung jalan tanpa config tambahan."
-            echo ""
-            echo "FIX lightrec (eksperimental): code buffer JIT sekarang pakai"
-            echo "ps3mapi (executable memory, butuh CFW Cobra/Mamba)."
-            echo "FALLBACK OTOMATIS: kalau ps3mapi tidak tersedia (bukan CFW),"
-            echo "core paksa pakai interpreter (tidak hang). Cek log:"
-            echo "  'ps3mapi executable memory OK' -> JIT siap, dynarec bisa dites"
-            echo "  'ps3mapi FAILED' -> paksa interpreter, dynarec diabaikan."
+            echo "FIX: _calli PS3 force-callr (c_wrapper descriptor fix)"
           } > dist/BUILD_INFO.txt
           find dist -type f | sort
 
