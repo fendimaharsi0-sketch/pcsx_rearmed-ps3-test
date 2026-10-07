@@ -17,7 +17,8 @@
 #     (Cobra/Mamba CFW syscall 8, is_executable=1).
 #     Ref: https://github.com/OsirizX/ps3mapi-lib
 #     Ref: https://github.com/irixxxx/picodrive/pull/82
-#     Fallback ke malloc + warning kalau ps3mapi gagal (bukan CFW).
+#     FALLBACK: kalau ps3mapi tidak tersedia, paksa interpreter otomatis
+#     (pola 3DS __ctr_svchax). Probe sekali saat opsi DRC dibaca.
 #     -D__PSL1GHT__ ditambahkan sebagai guard.
 #   - EKSPERIMEN: -D__powerpc__ ditambahkan di block psl1ght
 #     (Wii pakai -D__ppc__ -D__powerpc__). Harmless kalau redundan.
@@ -142,36 +143,62 @@ jobs:
                      '// NOTE: sys/process.h (sysProcessGetPid) is Sony SDK only;\n'
                      '// PSL1GHT uses POSIX getpid() from <unistd.h> (already included).\n'
                      '#include "ps3mapi_ps3_lib.h"\n'
+                     '#include <fcntl.h>\n'
+                     '#include <string.h>\n'
                      'static uint64_t lightrec_ps3_page_table[2] = {0, 0};\n'
+                     '// Unbuffered debug log (survives hard hangs - bypasses RetroArch logger)\n'
+                     'static void ps3_dbglog(const char *msg) {\n'
+                     '   int fd = open("/dev_hdd0/game/RETROARCH/USRDIR/ps3jit.log",\n'
+                     '                 O_WRONLY | O_CREAT | O_APPEND, 0644);\n'
+                     '   if (fd >= 0) { write(fd, msg, strlen(msg)); close(fd); }\n'
+                     '}\n'
                      '#endif')
           s = s.replace(old_inc, new_inc)
           print('plugin.c includes OK')
 
           # 3. plugin.c: code_buffer allocation via ps3mapi
+          # Fendi: JANGAN PERNAH fallback ke malloc biasa (pasti hang).
+          # Kalau ps3mapi gagal di sini, return error (tidak boleh hang diam-diam).
+          # Fallback ke interpreter sudah ditangani di libretro.c (probe).
+          # Debug: unbuffered log ke ps3jit.log (survive hard hang).
           old_alloc = ("\t\tcode_buffer = malloc(CODE_BUFFER_SIZE);\n"
                        "\t\tif (!code_buffer)\n"
                        "\t\t\treturn -ENOMEM;")
           assert s.count(old_alloc) == 1, 'alloc anchor count=%d' % s.count(old_alloc)
           new_alloc = ("\t\t#ifdef __PSL1GHT__\n"
-                       "\t\t// PS3 executable JIT memory (requires Cobra/Mamba CFW)\n"
-                       "\t\tif (ps3mapi_process_page_allocate(getpid(),\n"
-                       "\t\t\t\t\t\tCODE_BUFFER_SIZE, PAGE_SIZE_AUTO,\n"
-                       "\t\t\t\t\t\t0x2F, 1,\n"
-                       "\t\t\t\t\t\tlightrec_ps3_page_table) == 0 &&\n"
-                       "\t\t    lightrec_ps3_page_table[0]) {\n"
+                       "\t\t// PS3 executable JIT memory (requires Cobra/Mamba CFW).\n"
+                       "\t\t// NEVER fall back to malloc here - it WILL hang. If ps3mapi\n"
+                       "\t\t// fails, return error; libretro.c already forces interpreter\n"
+                       "\t\t// via ps3_jit_memory_available() probe.\n"
+                       "\t\t{\n"
+                       "\t\t\tchar dbgbuf[128];\n"
+                       "\t\t\tint pid = getpid();\n"
+                       "\t\t\tsnprintf(dbgbuf, sizeof(dbgbuf),\n"
+                       "\t\t\t\t \"ps3jit: plugin alloc start, pid=%d, size=%u\\n\",\n"
+                       "\t\t\t\t pid, (unsigned)CODE_BUFFER_SIZE);\n"
+                       "\t\t\tps3_dbglog(dbgbuf);\n"
+                       "\t\t\tif (ps3mapi_process_page_allocate(pid,\n"
+                       "\t\t\t\t\t\t\tCODE_BUFFER_SIZE, PAGE_SIZE_AUTO,\n"
+                       "\t\t\t\t\t\t\t0x2F, 1,\n"
+                       "\t\t\t\t\t\t\tlightrec_ps3_page_table) != 0 ||\n"
+                       "\t\t\t    !lightrec_ps3_page_table[0]) {\n"
+                       "\t\t\t\tps3_dbglog(\"ps3jit: plugin alloc FAILED\\n\");\n"
+                       "\t\t\t\tSysPrintf(\"lightrec: FATAL: ps3mapi page_allocate failed\\n\");\n"
+                       "\t\t\t\treturn -ENOMEM;\n"
+                       "\t\t\t}\n"
+                       "\t\t\tsnprintf(dbgbuf, sizeof(dbgbuf),\n"
+                       "\t\t\t\t \"ps3jit: plugin alloc OK @ %p\\n\",\n"
+                       "\t\t\t\t (void *)lightrec_ps3_page_table[0]);\n"
+                       "\t\t\tps3_dbglog(dbgbuf);\n"
                        "\t\t\tcode_buffer = (void *)lightrec_ps3_page_table[0];\n"
                        "\t\t\tSysPrintf(\"lightrec: PS3 executable code buffer @ %p (ps3mapi OK)\\n\",\n"
                        "\t\t\t\t  code_buffer);\n"
-                       "\t\t} else {\n"
-                       "\t\t\tSysPrintf(\"lightrec: ps3mapi FAILED (no Cobra/Mamba?), \"\n"
-                       "\t\t\t\t  \"malloc fallback - JIT will hang, use interpreter\\n\");\n"
-                       "\t\t\tcode_buffer = malloc(CODE_BUFFER_SIZE);\n"
                        "\t\t}\n"
                        "\t\t#else\n"
                        "\t\tcode_buffer = malloc(CODE_BUFFER_SIZE);\n"
-                       "\t\t#endif\n"
                        "\t\tif (!code_buffer)\n"
-                       "\t\t\treturn -ENOMEM;")
+                       "\t\t\treturn -ENOMEM;\n"
+                       "\t\t#endif")
           s = s.replace(old_alloc, new_alloc)
           print('plugin.c alloc OK')
 
@@ -200,6 +227,91 @@ jobs:
           s = s.replace(old_free, new_free)
           open(p, 'w', encoding='utf-8').write(s)
           print('plugin.c free OK')
+          EOF
+
+      - name: Patch core (PS3 JIT fallback to interpreter)
+        # Kalau ps3mapi tidak tersedia (bukan CFW Cobra/Mamba), paksa
+        # interpreter — jangan coba lightrec (akan hang). Pola sama seperti
+        # 3DS (__ctr_svchax check).
+        # Probe dilakukan sekali (cached) saat opsi DRC dibaca.
+        run: |
+          set -eu
+          python3 - <<'EOF'
+          p = 'core/frontend/libretro.c'
+          s = open(p, encoding='utf-8').read()
+
+          # 1. Helper function sebelum retro_load_game
+          old_func = "bool retro_load_game(const struct retro_game_info *info)"
+          assert s.count(old_func) == 1, 'func count=%d' % s.count(old_func)
+          helper = (
+              "#ifdef __PSL1GHT__\n"
+              "// PS3: JIT needs executable memory via ps3mapi (Cobra/Mamba CFW).\n"
+              "// Probe once and cache. If unavailable, force interpreter\n"
+              "// (same pattern as 3DS __ctr_svchax check).\n"
+              '#include "ps3mapi_ps3_lib.h"\n'
+              '#include <fcntl.h>\n'
+              '#include <string.h>\n'
+              "static void ps3_probe_log(const char *msg) {\n"
+              "   int fd = open(\"/dev_hdd0/game/RETROARCH/USRDIR/ps3jit.log\",\n"
+              "                 O_WRONLY | O_CREAT | O_APPEND, 0644);\n"
+              "   if (fd >= 0) { write(fd, msg, strlen(msg)); close(fd); }\n"
+              "}\n"
+              "static int ps3_jit_memory_available(void)\n"
+              "{\n"
+              "   static int checked = 0;\n"
+              "   static int available = 0;\n"
+              "   if (!checked) {\n"
+              "      uint64_t test_table[2] = {0, 0};\n"
+              "      int pid = getpid();\n"
+              "      char dbgbuf[128];\n"
+              '      snprintf(dbgbuf, sizeof(dbgbuf), "ps3jit: probe start, pid=%d\\n", pid);\n'
+              "      ps3_probe_log(dbgbuf);\n"
+              "      if (ps3mapi_process_page_allocate(pid, 4096,\n"
+              "                                        PAGE_SIZE_AUTO, 0x2F, 1,\n"
+              "                                        test_table) == 0 &&\n"
+              "          test_table[0]) {\n"
+              '         ps3_probe_log("ps3jit: probe alloc OK\\n");\n'
+              "         ps3mapi_process_page_free(pid, 0x2F, test_table);\n"
+              '         ps3_probe_log("ps3jit: probe free OK\\n");\n'
+              "         available = 1;\n"
+              '         SysPrintf("ps3: ps3mapi executable memory OK - JIT available\\\\n");\n'
+              "      }\n"
+              "      else {\n"
+              '         ps3_probe_log("ps3jit: probe FAILED\\n");\n'
+              '         SysPrintf("ps3: ps3mapi FAILED (no Cobra/Mamba?) - forcing interpreter\\\\n");\n'
+              "      }\n"
+              "      checked = 1;\n"
+              "   }\n"
+              "   return available;\n"
+              "}\n"
+              "#endif\n"
+              "\n"
+              "bool retro_load_game(const struct retro_game_info *info)")
+          s = s.replace(old_func, helper)
+          print('ps3_jit_memory_available helper OK')
+
+          # 2. Force interpreter kalau ps3mapi tidak tersedia (pola 3DS)
+          old_drc = ("#ifdef _3DS\n"
+                     "      if (!__ctr_svchax)\n"
+                     "         Config.Cpu = CPU_INTERPRETER;\n"
+                     "      else\n"
+                     "#endif\n"
+                     '      if (strcmp(var.value, "disabled") == 0)')
+          assert s.count(old_drc) == 1, 'drc count=%d' % s.count(old_drc)
+          new_drc = ("#ifdef _3DS\n"
+                     "      if (!__ctr_svchax)\n"
+                     "         Config.Cpu = CPU_INTERPRETER;\n"
+                     "      else\n"
+                     "#endif\n"
+                     "#ifdef __PSL1GHT__\n"
+                     "      if (!ps3_jit_memory_available())\n"
+                     "         Config.Cpu = CPU_INTERPRETER;\n"
+                     "      else\n"
+                     "#endif\n"
+                     '      if (strcmp(var.value, "disabled") == 0)')
+          s = s.replace(old_drc, new_drc)
+          open(p, 'w', encoding='utf-8').write(s)
+          print('PS3 JIT fallback OK')
           EOF
 
       - name: Patch core (drc default off + PPC define)
@@ -350,10 +462,10 @@ jobs:
             echo ""
             echo "FIX lightrec (eksperimental): code buffer JIT sekarang pakai"
             echo "ps3mapi (executable memory, butuh CFW Cobra/Mamba)."
-            echo "Untuk ngetes: nyalakan Quick Menu -> Options -> Dynamic"
-            echo "Recompiler = enabled. Cek log (log_to_file=true):"
-            echo "  'ps3mapi OK' -> alokasi berhasil, lihat apakah masih hang/crash"
-            echo "  'ps3mapi FAILED' -> bukan CFW Cobra, tetap pakai interpreter."
+            echo "FALLBACK OTOMATIS: kalau ps3mapi tidak tersedia (bukan CFW),"
+            echo "core paksa pakai interpreter (tidak hang). Cek log:"
+            echo "  'ps3mapi executable memory OK' -> JIT siap, dynarec bisa dites"
+            echo "  'ps3mapi FAILED' -> paksa interpreter, dynarec diabaikan."
           } > dist/BUILD_INFO.txt
           find dist -type f | sort
 
