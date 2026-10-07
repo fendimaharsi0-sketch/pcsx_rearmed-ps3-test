@@ -265,6 +265,40 @@ jobs:
           s = s.replace(old_free, new_free)
           open(p, 'w', encoding='utf-8').write(s)
           print('plugin.c free OK')
+
+          # 5. plugin.c: heartbeat log di execute (diagnosis hang: compile vs exec)
+          # Kalau "execute start" muncul tapi hang, berarti di dalam lightrec_execute.
+          # Kalau tidak muncul sama sekali, hang sebelum execute dipanggil.
+          p = 'core/libpcsxcore/lightrec/plugin.c'
+          s = open(p, encoding='utf-8').read()
+          old_exec = "static void lightrec_plugin_execute_internal(bool block_only)"
+          assert s.count(old_exec) == 1, 'exec anchor count=%d' % s.count(old_exec)
+          new_exec = ("#ifdef __PSL1GHT__\n"
+                      "static void ps3_exec_log(const char *msg) {\n"
+                      "   int fd = open(\"/dev_hdd0/game/RETROARCH/USRDIR/ps3jit.log\",\n"
+                      "                 O_WRONLY | O_CREAT | O_APPEND, 0644);\n"
+                      "   if (fd >= 0) { write(fd, msg, strlen(msg)); close(fd); }\n"
+                      "}\n"
+                      "#endif\n"
+                      "static void lightrec_plugin_execute_internal(bool block_only)")
+          s = s.replace(old_exec, new_exec)
+          old_body2 = ("#endif\n"
+                       "static void lightrec_plugin_execute_internal(bool block_only)\n"
+                       "{")
+          assert s.count(old_body2) == 1, 'exec body count=%d' % s.count(old_body2)
+          new_body2 = ("#endif\n"
+                       "static void lightrec_plugin_execute_internal(bool block_only)\n"
+                       "{\n"
+                       "#ifdef __PSL1GHT__\n"
+                       "   {\n"
+                       "      char b[64];\n"
+                       "      snprintf(b, sizeof(b), \"ps3jit: execute start, pc=%08x\\n\", (unsigned)psxRegs.pc);\n"
+                       "      ps3_exec_log(b);\n"
+                       "   }\n"
+                       "#endif")
+          s = s.replace(old_body2, new_body2)
+          open(p, 'w', encoding='utf-8').write(s)
+          print('plugin.c execute heartbeat OK')
           EOF
 
       - name: Patch Lightning (PS3 function descriptor / TOC)
