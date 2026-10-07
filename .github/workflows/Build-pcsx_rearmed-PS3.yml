@@ -1,0 +1,238 @@
+# DRAFT — pola sama seperti build-mame2003-plus-ps3.yml (v7):
+# tiap SELF PS3 = RetroArch frontend + 1 core, static link.
+# Bedanya cuma core-nya: pcsx_rearmed, yang Makefile.libretro-nya SUDAH punya
+# target platform=psl1ght:
+#   - TARGET := pcsx_rearmed_libretro_psl1ght.a (static, pas buat SELF)
+#   - CFLAGS += -DBLARGG_BIG_ENDIAN=1 -D__ppc__ (endian PS3 di-handle)
+#   - DYNAREC default = lightrec (bukan interpreter!) — Lightrec README klaim
+#     support PowerPC via GNU Lightning; precedent big-endian PPC = target
+#     wii/ngc di Makefile yang sama.
+#   - PATCH (2026-10-07, Fendi): default pcsx_rearmed_drc -> "disabled"
+#     (interpreter). Tiap build baru langsung jalan tanpa config custom;
+#     dynarec bisa dinyalakan via Core Options untuk ngetes fix.
+#     Alasan: lightrec + PS3 = hang saat load game (terbukti via tes
+#     interpreter; BIOS asli tidak menyelesaikan).
+#   - EKSPERIMEN FIX lightrec: -D__powerpc__ ditambahkan di block psl1ght
+#     (Wii pakai -D__ppc__ -D__powerpc__). Harmless kalau redundan.
+#   - BUILTIN_GPU default = peops (soft GPU, BUILTIN_GPU ?= peops)
+#   - CC = $(PS3DEV)/ppu/bin/ppu-gcc (butuh PS3DEV di env — di-set step Toolchain)
+# Target psl1ght TIDAK di-CI upstream -> build ini belum terverifikasi;
+# Fendi jadi tester pertama. Cek di log step "Build core": baris
+# "DYNAREC: lightrec" dan "BUILTIN_GPU: peops" (Makefile nge-print info).
+#
+# Pelajaran dari run mame2003-plus yang dibawa ke sini:
+#  - container --user root (git clone permission denied kalau non-root)
+#  - jangan pakai `zip` manual (tidak ada di container)
+#  - sparse checkout retroarch-assets pakai pola --no-checkout
+#  - patch EMULATOR_CONTENT_DIR -> sharing config/aset/save dengan CE
+#  - patch CE return-to-menu (UNLOAD_CORE -> RESTART -> exitspawn SELF sendiri)
+
+name: Build pcsx_rearmed PS3 SELF
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_ref:
+        description: 'pcsx_rearmed ref (branch/tag/commit)'
+        default: 'master'
+        required: false
+      frontend_ref:
+        description: 'RetroArch ref to link against'
+        default: 'master'
+        required: false
+      port_dir:
+        description: 'Nama folder game PS3 yg di-share dengan CE (port dir)'
+        default: 'RETROARCH'
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    container:
+      image: reallibretroretroarch/libretro-build-psl1ght:latest
+      options: --user root
+
+    steps:
+      - name: Toolchain environment
+        run: |
+          set -eu
+          : "${PS3DEV:=/usr/local/ps3dev}"
+          : "${PSL1GHT:=$PS3DEV}"
+          if [ -d "$PSL1GHT/portlibs" ]; then
+            PORTLIBS="$PSL1GHT/portlibs"
+          elif [ -d "$PS3DEV/portlibs" ]; then
+            PORTLIBS="$PS3DEV/portlibs"
+          else
+            PORTLIBS="$PSL1GHT/portlibs"
+          fi
+          {
+            echo "PS3DEV=$PS3DEV"
+            echo "PSL1GHT=$PSL1GHT"
+            echo "PORTLIBS=$PORTLIBS"
+            echo "PATH=$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin:$PATH"
+          } >> "$GITHUB_ENV"
+          echo '--- toolchain probe ---'
+          ls "$PS3DEV/ppu/bin" 2>/dev/null | grep -E '^ppu-.*gcc$' | head -5 || echo 'ppu gcc NOT FOUND'
+          command -v make_self fself ppu-ar 2>/dev/null || echo 'make_self/fself/ppu-ar NOT ALL FOUND'
+          test -f "$PSL1GHT/ppu_rules" && echo 'ppu_rules OK' || echo 'ppu_rules MISSING'
+
+      - name: Clone sources
+        run: |
+          set -eu
+          command -v git >/dev/null || { apt-get update -qq && apt-get install -y -qq git; }
+          clone_ref() {
+            local url="$1" dir="$2" ref="$3"
+            rm -rf "$dir"
+            git init -q "$dir"
+            ( cd "$dir" && git remote add origin "$url" \
+              && git fetch -q --depth 1 origin "$ref" \
+              && git checkout -q FETCH_HEAD )
+            echo "$dir: $(cd "$dir" && git rev-parse --short HEAD) $(cd "$dir" && git log -1 --format=%cd --date=short)"
+          }
+          clone_ref https://github.com/libretro/pcsx_rearmed.git core "${{ inputs.core_ref }}"
+          clone_ref https://github.com/libretro/RetroArch.git frontend "${{ inputs.frontend_ref }}"
+
+      - name: Patch core (drc default off + PPC define)
+        # 1. pcsx_rearmed_drc default -> "disabled": tiap build baru langsung
+        #    jalan (interpreter) tanpa config custom tambahan; dynarec tetap
+        #    bisa dinyalakan via Core Options kalau mau ngetes fix.
+        #    (Fendi: "dyna default mati aja".)
+        # 2. -D__powerpc__ di block psl1ght (eksperimen fix lightrec; target Wii
+        #    pakai -D__ppc__ -D__powerpc__, psl1ght cuma -D__ppc__. Kemungkinan
+        #    sudah implisit dari compiler — harmless kalau redundant.)
+        run: |
+          set -eu
+          python3 - <<'EOF'
+          p = 'core/frontend/libretro_core_options.h'
+          s = open(p, encoding='utf-8').read()
+          i = s.find('"pcsx_rearmed_drc",')
+          assert i != -1, 'drc key not found'
+          seg = s[i:i+1500]
+          old = '         { NULL, NULL },\n      },\n      "enabled",'
+          assert seg.count(old) == 1, 'drc default anchor count=%d' % seg.count(old)
+          seg = seg.replace(old, '         { NULL, NULL },\n      },\n      "disabled",')
+          s = s[:i] + seg + s[i+1500:]
+          open(p, 'w', encoding='utf-8').write(s)
+          print('drc default -> disabled OK')
+
+          p = 'core/Makefile.libretro'
+          s = open(p, encoding='utf-8').read()
+          old = 'CFLAGS += -DBLARGG_BIG_ENDIAN=1 -D__ppc__'
+          assert s.count(old) == 1, 'ppc cflags count=%d' % s.count(old)
+          s = s.replace(old, old + ' -D__powerpc__')
+          open(p, 'w', encoding='utf-8').write(s)
+          print('__powerpc__ define OK')
+          EOF
+
+      - name: Align port dir with CE
+        run: |
+          set -eu
+          PORT_DIR="${{ inputs.port_dir }}"
+          f=frontend/frontend/drivers/platform_ps3.c
+          grep -q '#define EMULATOR_CONTENT_DIR "SSNE10001"' "$f"
+          sed -i "s/#define EMULATOR_CONTENT_DIR \"SSNE10001\"/#define EMULATOR_CONTENT_DIR \"$PORT_DIR\"/" "$f"
+          grep -n '#define EMULATOR_CONTENT_DIR' "$f"
+
+      - name: Apply CE return-to-menu patch
+        run: |
+          set -eu
+          python3 - <<'EOF'
+          p = 'frontend/retroarch.c'
+          s = open(p, encoding='utf-8').read()
+          anchor = "      case CMD_EVENT_UNLOAD_CORE:\n         {\n"
+          assert s.count(anchor) == 1, 'anchor count=%d' % s.count(anchor)
+          patch = ("      case CMD_EVENT_UNLOAD_CORE:\n"
+                   "         {\n"
+                   "            /* CE-style return-to-menu (port of CE RetroArchPatch.sh):\n"
+                   "               static core can't truly unload in-process;\n"
+                   "               reboot the SELF into its own menu instead of\n"
+                   "               exiting to XMB. */\n"
+                   "            command_event(CMD_EVENT_RESTART_RETROARCH, NULL);\n"
+                   "            break;\n")
+          open(p, 'w', encoding='utf-8').write(s.replace(anchor, patch))
+          print('return-to-menu patch OK')
+          EOF
+          grep -n -A4 'CE-style return-to-menu' frontend/retroarch.c | head -8
+
+      - name: Build core (static lib)
+        # Makefile.libretro nge-print TARGET/platform/ARCH/DYNAREC/BUILTIN_GPU
+        # di awal — verifikasi di log: DYNAREC harusnya "lightrec",
+        # BUILTIN_GPU "peops". Kalau DYNAREC kosong/jatuh ke interpreter,
+        # lapor log-nya.
+        run: |
+          set -eu
+          cd core
+          make -f Makefile.libretro platform=psl1ght -j"$(nproc)" V=1
+          ls -la pcsx_rearmed_libretro_psl1ght.a
+
+      - name: Link frontend + core, make SELF
+        run: |
+          set -eu
+          cp core/pcsx_rearmed_libretro_psl1ght.a frontend/libretro_psl1ght.a
+          cd frontend
+          make -f Makefile.psl1ght -j"$(nproc)" V=1
+          ls -la retroarch_psl1ght.self
+
+      - name: Fetch menu assets (RGUI)
+        # RGUI tidak butuh PNG ikon (semuanya digambar prosedural) — yang
+        # dibundle cuma theme .cfg (~500 byte per file). Fendi: "aset make
+        # r-gui saja".
+        # NOTE: theme ini cuma kepakai kalau menu_driver = "rgui" di
+        # retroarch.cfg (config kita sharing dengan CE — set manual).
+        run: |
+          set -eu
+          rm -rf assets-src
+          git clone --depth 1 --filter=blob:none --no-checkout \
+            https://github.com/libretro/retroarch-assets.git assets-src
+          cd assets-src
+          if git sparse-checkout init --cone 2>/dev/null; then
+            git sparse-checkout set rgui
+          else
+            echo 'sparse-checkout tidak didukung git ini -> checkout penuh'
+          fi
+          git checkout
+          cd ..
+          mkdir -p dist/assets
+          cp -r assets-src/rgui dist/assets/
+          echo "assets commit: $(cd assets-src && git rev-parse --short HEAD)"
+          find dist/assets -type f | wc -l
+          du -sh dist/assets
+
+      - name: Package artifact
+        run: |
+          set -eu
+          SELF_NAME='pcsx_rearmed_libretro_ps3.SELF'
+          PORT_DIR="${{ inputs.port_dir }}"
+          cp frontend/retroarch_psl1ght.self "dist/$SELF_NAME"
+          {
+            echo "core:     libretro/pcsx_rearmed @ $(cd core && git rev-parse --short HEAD) ($(cd core && git log -1 --format=%cd --date=short))"
+            echo "frontend: libretro/RetroArch @ $(cd frontend && git rev-parse --short HEAD) ($(cd frontend && git log -1 --format=%cd --date=short))"
+            echo "assets:   libretro/retroarch-assets @ $(cd assets-src && git rev-parse --short HEAD) (rgui themes)"
+            echo "port_dir: $PORT_DIR (sharing config/aset/save dengan CE)"
+            echo "built:    $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+            echo "INSTALL DI PS3 (via menu CE):"
+            echo "  1. BACKUP dulu /dev_hdd0/game/$PORT_DIR/USRDIR/retroarch.cfg (jaga-jaga)"
+            echo "  2. $SELF_NAME -> /dev_hdd0/game/$PORT_DIR/USRDIR/cores/ (FTP)"
+            echo "  3. aset RGUI: copy isi folder assets/rgui/ ke"
+            echo "     /dev_hdd0/game/$PORT_DIR/USRDIR/assets/rgui/."
+            echo "     Lalu set menu_driver = \"rgui\" di retroarch.cfg"
+            echo "     (theme .cfg cuma kepakai di driver rgui)."
+            echo "  4. BIOS PS1 ASLI (wajib!): Lightrec tidak jalan dengan HLE BIOS."
+            echo "     Taruh scph5500/scph5501/scph5502.bin di system dir"
+            echo "     (/dev_hdd0/game/$PORT_DIR/USRDIR/system/)."
+            echo "  5. Launch dari menu CE seperti core biasa."
+            echo ""
+            echo "CATATAN: dynarec default = DISABLED (interpreter) di build ini."
+            echo "Game langsung jalan tanpa config tambahan. Untuk ngetes"
+            echo "lightrec (+ eksperimen -D__powerpc__), nyalakan via"
+            echo "Quick Menu -> Options -> Dynamic Recompiler."
+          } > dist/BUILD_INFO.txt
+          find dist -type f | sort
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: pcsx_rearmed_libretro_ps3
+          path: dist/
