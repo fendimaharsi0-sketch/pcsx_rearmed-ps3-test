@@ -1,0 +1,175 @@
+# TEST REPO — pcsx_rearmed PS3, iterasi cepat satu core.
+# Dibuat 2026-10-07 setelah Plan B 8-core: pcsx_rearmed SELF ke-load (P2P OK)
+# tapi load game -> layar hitam + PS3 hang.
+# Hipotesis: DYNAREC=lightrec (default master) bermasalah di PPC32; target
+# psl1ght tidak pernah disable dynarec (build 1.9.x = interpreter).
+# Workflow ini Plan B-style (standalone SSNE10001, EBOOT.BIN = SELF-nya
+# sendiri) supaya lingkungan test SAMA dengan saat bug ditemukan.
+# Input dynarec/gpu bisa diubah per-run untuk eksperimen tanpa edit file.
+# Menu = RGUI (patch default di configuration.c, prosedural tanpa aset PNG)
+# -> step fetch-assets DIHAPUS.
+
+name: Build pcsx_rearmed PS3 (test)
+
+on:
+  workflow_dispatch:
+    inputs:
+      core_ref:
+        description: 'pcsx_rearmed ref (branch/tag/commit)'
+        default: 'master'
+        required: false
+      frontend_ref:
+        description: 'RetroArch ref to link against'
+        default: 'master'
+        required: false
+      dynarec:
+        description: 'Dynarec: 0 = interpreter (aman), lightrec = default master'
+        default: '0'
+        required: false
+      builtin_gpu:
+        description: 'GPU plugin: peops (default) / unai'
+        default: 'peops'
+        required: false
+      port_dir:
+        description: 'Nama folder game PS3 (port dir)'
+        default: 'SSNE10001'
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container:
+      image: reallibretroretroarch/libretro-build-psl1ght:latest
+      options: --user root
+
+    steps:
+      - name: Toolchain environment
+        run: |
+          set -eu
+          : "${PS3DEV:=/usr/local/ps3dev}"
+          : "${PSL1GHT:=$PS3DEV}"
+          if [ -z "${PORTLIBS:-}" ]; then
+            if [ -d "$PSL1GHT/portlibs" ]; then
+              PORTLIBS="$PSL1GHT/portlibs"
+            elif [ -d "$PS3DEV/portlibs" ]; then
+              PORTLIBS="$PS3DEV/portlibs"
+            else
+              PORTLIBS="$PSL1GHT/portlibs"
+            fi
+          fi
+          if [ -x "$PS3DEV/ppu/bin/ppu-lv2-gcc" ]; then
+            COMMONLV="lv2-"
+          else
+            COMMONLV=""
+          fi
+          {
+            echo "PS3DEV=$PS3DEV"
+            echo "PSL1GHT=$PSL1GHT"
+            echo "PORTLIBS=$PORTLIBS"
+            echo "COMMONLV=$COMMONLV"
+            echo "PATH=$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin:$PATH"
+          } >> "$GITHUB_ENV"
+          echo '--- toolchain probe ---'
+          ls "$PS3DEV/ppu/bin" 2>/dev/null | grep -E '^ppu-.*gcc$' | head -5 || echo 'ppu gcc NOT FOUND'
+          command -v make_self fself ppu-ar 2>/dev/null || echo 'make_self/fself/ppu-ar NOT ALL FOUND'
+          test -f "$PSL1GHT/ppu_rules" && echo 'ppu_rules OK' || echo 'ppu_rules MISSING'
+
+      - name: Clone sources
+        run: |
+          set -eu
+          command -v git >/dev/null || { apt-get update -qq && apt-get install -y -qq git; }
+          clone_ref() {
+            local url="$1" dir="$2" ref="$3"
+            rm -rf "$dir"
+            git init -q "$dir"
+            ( cd "$dir" && git remote add origin "$url" \
+              && git fetch -q --depth 1 origin "$ref" \
+              && git checkout -q FETCH_HEAD )
+            echo "$dir: $(cd "$dir" && git rev-parse --short HEAD) $(cd "$dir" && git log -1 --format=%cd --date=short)"
+          }
+          clone_ref https://github.com/libretro/pcsx_rearmed.git core "${{ inputs.core_ref }}"
+          clone_ref https://github.com/libretro/RetroArch.git frontend "${{ inputs.frontend_ref }}"
+
+      - name: Patch frontend (port dir + return-to-menu + RGUI default)
+        run: |
+          set -eu
+          PORT_DIR="${{ inputs.port_dir }}"
+          f=frontend/frontend/drivers/platform_ps3.c
+          if [ "$PORT_DIR" != "SSNE10001" ]; then
+            grep -q '#define EMULATOR_CONTENT_DIR "SSNE10001"' "$f"
+            sed -i "s/#define EMULATOR_CONTENT_DIR \"SSNE10001\"/#define EMULATOR_CONTENT_DIR \"$PORT_DIR\"/" "$f"
+          fi
+          grep -n '#define EMULATOR_CONTENT_DIR' "$f"
+          python3 - <<'EOF'
+          # 1. return-to-menu (port of CE RetroArchPatch.sh)
+          p = 'frontend/retroarch.c'
+          s = open(p, encoding='utf-8').read()
+          anchor = "      case CMD_EVENT_UNLOAD_CORE:\n         {\n"
+          assert s.count(anchor) == 1, 'anchor count=%d' % s.count(anchor)
+          patch = ("      case CMD_EVENT_UNLOAD_CORE:\n"
+                   "         {\n"
+                   "            /* CE-style return-to-menu (port of CE RetroArchPatch.sh) */\n"
+                   "            command_event(CMD_EVENT_RESTART_RETROARCH, NULL);\n"
+                   "            break;\n")
+          open(p, 'w', encoding='utf-8').write(s.replace(anchor, patch))
+          print('return-to-menu patch OK')
+
+          # 2. default menu driver -> RGUI (prosedural, nol aset PNG).
+          #    Tanpa ini default PS3 = Ozone (butuh aset); XMB juga butuh aset.
+          p = 'frontend/configuration.c'
+          s = open(p, encoding='utf-8').read()
+          anchor = ("#if (defined(_3DS) || defined(DINGUX)) && defined(HAVE_RGUI)\n"
+                    "static const enum menu_driver_enum MENU_DEFAULT_DRIVER = MENU_RGUI;\n")
+          assert s.count(anchor) == 1, 'rgui anchor count=%d' % s.count(anchor)
+          patch = (anchor +
+                   "#elif defined(__PS3__) && defined(HAVE_RGUI)\n"
+                   "static const enum menu_driver_enum MENU_DEFAULT_DRIVER = MENU_RGUI;\n")
+          open(p, 'w', encoding='utf-8').write(s.replace(anchor, patch))
+          print('RGUI default patch OK')
+          EOF
+
+      - name: Build core (static lib)
+        run: |
+          set -eu
+          cd core
+          make -f Makefile.libretro platform=psl1ght -j"$(nproc)" V=1 \
+            "COMMONLV=$COMMONLV" \
+            "DYNAREC=${{ inputs.dynarec }}" \
+            "BUILTIN_GPU=${{ inputs.builtin_gpu }}"
+          ls -la pcsx_rearmed_libretro_psl1ght.a
+
+      - name: Link frontend + core, make SELF
+        run: |
+          set -eu
+          cp core/pcsx_rearmed_libretro_psl1ght.a frontend/libretro_psl1ght.a
+          cd frontend
+          make -f Makefile.psl1ght -j"$(nproc)" V=1
+          ls -la retroarch_psl1ght.self
+
+      - name: Assemble game folder
+        # NOTE: tidak bundle aset — menu driver default = RGUI (prosedural,
+        # nol PNG). Step fetch-assets dihapus.
+        run: |
+          set -eu
+          PORT_DIR="${{ inputs.port_dir }}"
+          PKGDIR="dist/$PORT_DIR"
+          mkdir -p "$PKGDIR/USRDIR"
+          cp frontend/retroarch_psl1ght.self "$PKGDIR/USRDIR/EBOOT.BIN"
+          cp frontend/pkg/psl1ght/pkg/PARAM.SFO "$PKGDIR/"
+          cp frontend/pkg/psl1ght/pkg/ICON0.PNG "$PKGDIR/"
+          {
+            echo "core:     libretro/pcsx_rearmed @ $(cd core && git rev-parse --short HEAD) ($(cd core && git log -1 --format=%cd --date=short))"
+            echo "frontend: libretro/RetroArch @ $(cd frontend && git rev-parse --short HEAD) ($(cd frontend && git log -1 --format=%cd --date=short))"
+            echo "dynarec:  ${{ inputs.dynarec }} | gpu: ${{ inputs.builtin_gpu }}"
+            echo "built:    $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+            echo "INSTALL: copy folder $PORT_DIR/ -> /dev_hdd0/game/ via FTP, reboot PS3."
+          } > dist/BUILD_INFO.txt
+          find dist -type f | sort
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: pcsx_rearmed_ps3_test
+          path: dist/
