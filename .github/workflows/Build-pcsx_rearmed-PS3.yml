@@ -132,11 +132,12 @@ jobs:
           # 1. Makefile: tambah -D__PSL1GHT__ di block psl1ght
           # NOTE: step ini jalan SEBELUM step "drc default off", jadi anchor
           # masih baris original tanpa -D__powerpc__.
+          # Juga tambah -I$(PS3DEV)/ppu/include untuk ppu-lv2.h (lv2syscall).
           p = 'core/Makefile.libretro'
           s = open(p, encoding='utf-8').read()
           old = 'CFLAGS += -DBLARGG_BIG_ENDIAN=1 -D__ppc__'
           assert s.count(old) == 1, 'cflags count=%d' % s.count(old)
-          s = s.replace(old, old + ' -D__PSL1GHT__')
+          s = s.replace(old, old + ' -D__PSL1GHT__ -I$(PS3DEV)/ppu/include')
           open(p, 'w', encoding='utf-8').write(s)
           print('__PSL1GHT__ define OK')
 
@@ -365,9 +366,9 @@ jobs:
 
           p = 'core/Makefile.libretro'
           s = open(p, encoding='utf-8').read()
-          # NOTE: step ps3mapi sudah jalan duluan dan nambah -D__PSL1GHT__,
-          # jadi anchor di sini termasuk itu.
-          old = 'CFLAGS += -DBLARGG_BIG_ENDIAN=1 -D__ppc__ -D__PSL1GHT__'
+          # NOTE: step ps3mapi sudah jalan duluan dan nambah -D__PSL1GHT__
+          # + -I$(PS3DEV)/ppu/include, jadi anchor di sini termasuk itu.
+          old = 'CFLAGS += -DBLARGG_BIG_ENDIAN=1 -D__ppc__ -D__PSL1GHT__ -I$(PS3DEV)/ppu/include'
           assert s.count(old) == 1, 'ppc cflags count=%d' % s.count(old)
           s = s.replace(old, old + ' -D__powerpc__')
           open(p, 'w', encoding='utf-8').write(s)
