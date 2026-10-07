@@ -22,9 +22,9 @@
 #     -D__PSL1GHT__ ditambahkan sebagai guard.
 #   - EKSPERIMEN: -D__powerpc__ ditambahkan di block psl1ght
 #     (Wii pakai -D__ppc__ -D__powerpc__). Harmless kalau redundan.
-#     CATATAN: TOC/OPD fix (PicoDrive PR #82) BELUM di-port ke lightning.
-#     Kalau masih crash (bukan hang) setelah executable memory, itu tersangka
-#     berikutnya.
+#     CATATAN: TOC/OPD fix (PicoDrive PR #82) di-port ke Lightning
+#     jit_ppc-cpu.c (_callr) pada 2026-10-07. Kalau masih hang, tersangka
+#     berikutnya = hal lain di backend PPC64 Lightning.
 #   - BUILTIN_GPU default = peops (soft GPU, BUILTIN_GPU ?= peops)
 #   - CC = $(PS3DEV)/ppu/bin/ppu-gcc (butuh PS3DEV di env — di-set step Toolchain)
 # Target psl1ght TIDAK di-CI upstream -> build ini belum terverifikasi;
@@ -265,6 +265,66 @@ jobs:
           s = s.replace(old_free, new_free)
           open(p, 'w', encoding='utf-8').write(s)
           print('plugin.c free OK')
+          EOF
+
+      - name: Patch Lightning (PS3 function descriptor / TOC)
+        # ROOT CAUSE (2026-10-07): Lightning's _callr() tidak handle PS3
+        # function descriptor. _CALL_AIXDESC cuma aktif buat AIX, bukan PS3.
+        # Akibat: indirect call ke C helper loncat ke descriptor (data),
+        # bukan ke alamat kode -> hang.
+        # Fix: port pola irixxxx/picodrive#82 ke jit_ppc-cpu.c.
+        # PS3 descriptor = [addr, toc] (16 byte), bukan 24 byte kayak AIX.
+        run: |
+          set -eu
+          python3 - <<'EOF'
+          p = 'core/deps/lightning/lib/jit_ppc-cpu.c'
+          s = open(p, encoding='utf-8').read()
+
+          # 1. _callr(): tambah PS3 descriptor handling sebelum _CALL_AIXDESC
+          old_call = ("       )\n"
+                      "{\n"
+                      "#  if _CALL_AIXDESC\n"
+                      "    stxi(sizeof(void*) * 5, _SP_REGNO, _R2_REGNO);")
+          assert s.count(old_call) == 1, 'callr anchor count=%d' % s.count(old_call)
+          new_call = ("       )\n"
+                      "{\n"
+                      "#  if defined(__PSL1GHT__) || defined(__PS3__)\n"
+                      "    /* PS3: function descriptor = [addr, toc] (16 bytes).\n"
+                      "     * NOT 24 bytes like AIX. Load TOC from [r0+8] -> r2,\n"
+                      "     * addr from [r0] -> r0. Port of irixxxx/picodrive#82. */\n"
+                      "    stxi(sizeof(void*) * 5, _SP_REGNO, _R2_REGNO);\n"
+                      "    if (r0 == _R0_REGNO) {\n"
+                      "        movr(_R11_REGNO, _R0_REGNO);\n"
+                      "        ldxi(_R2_REGNO, _R11_REGNO, sizeof(void*));\n"
+                      "        ldr(_R11_REGNO, _R11_REGNO);\n"
+                      "        movr(_R0_REGNO, _R11_REGNO);\n"
+                      "    }\n"
+                      "    else {\n"
+                      "        ldxi(_R2_REGNO, r0, sizeof(void*));\n"
+                      "        ldr(r0, r0);\n"
+                      "    }\n"
+                      "#  elif _CALL_AIXDESC\n"
+                      "    stxi(sizeof(void*) * 5, _SP_REGNO, _R2_REGNO);")
+          s = s.replace(old_call, new_call)
+          print('_callr PS3 descriptor OK')
+
+          # 2. _callr(): restore r2 juga buat PS3 (bukan cuma AIX)
+          old_restore = ("#  if _CALL_AIXDESC\n"
+                         "    ldxi(_R2_REGNO, _SP_REGNO, sizeof(void*) * 5);\n"
+                         "#  endif\n"
+                         "}\n"
+                         "\n"
+                         "/* assume fixed address or reachable address */")
+          assert s.count(old_restore) == 1, 'restore anchor count=%d' % s.count(old_restore)
+          new_restore = ("#  if defined(__PSL1GHT__) || defined(__PS3__) || _CALL_AIXDESC\n"
+                         "    ldxi(_R2_REGNO, _SP_REGNO, sizeof(void*) * 5);\n"
+                         "#  endif\n"
+                         "}\n"
+                         "\n"
+                         "/* assume fixed address or reachable address */")
+          s = s.replace(old_restore, new_restore)
+          open(p, 'w', encoding='utf-8').write(s)
+          print('_callr r2 restore OK')
           EOF
 
       - name: Patch core (PS3 JIT fallback to interpreter)
