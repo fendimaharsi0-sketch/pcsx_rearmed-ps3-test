@@ -9,7 +9,7 @@ learned, and why we stopped — for anyone who wants to continue this work.
 
 ## Background
 
-- **Target:** RetroArch PS3 (PSL1GHT/FOSS SDK) Plan A core — static SELF that
+- **Target:** RetroArch PS3 (PSL1GHT/FOSS SDK) — static SELF that
   runs in Crystal CE ecosystem (`/dev_hdd0/game/RETROARCH/`).
 - **Core:** libretro/pcsx_rearmed, `platform=psl1ght` target.
 - **Problem:** With Lightrec enabled (default), loading any game → black screen
