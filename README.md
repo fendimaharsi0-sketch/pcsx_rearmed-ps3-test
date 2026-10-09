@@ -1,6 +1,6 @@
 # pcsx_rearmed PS3 Test
 
-Build & test repo for **PCSX-ReARMed on PlayStation 3** (RetroArch Plan A core).
+Build & test repo for **PCSX-ReARMed on PlayStation 3** (RetroArch).
 
 ## What is this?
 
